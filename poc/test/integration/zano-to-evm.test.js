@@ -1,5 +1,5 @@
 // ============================================================================
-// Integration Test: Zano → EVM Bridge Flow
+// Integration Test: Zano → EVM Bridge Flow (TSS)
 // ============================================================================
 //
 // Simulates the complete flow when a user burns tokens on Zano to receive
@@ -10,29 +10,27 @@
 //   3. Leader proposes the deposit for signing
 //   4. Acceptors verify the burn on-chain (via Zano RPC)
 //   5. Acceptors ACK → leader selects 2-of-3 signers
-//   6. Selected signers compute the EVM withdrawal hash
-//   7. Each signer signs with EIP-191 (matches Bridge.sol _checkSignatures)
-//   8. Leader collects signatures and updates deposit as "signed"
-//   9. Anyone can call withdrawNative/withdrawERC20 on Bridge.sol
-//
-// Steps 1-8 are simulated here. Step 9 is tested in contract/bridge.test.js.
+//   6. Both signers compute the EVM withdrawal hash (deterministic)
+//   7. Both signers run DKLs23 TSS protocol → single combined ECDSA signature
+//   8. Leader computes V, formats 65-byte sig, stores as "signed"
+//   9. Leader submits withdrawERC20() with 1 TSS signature (contract threshold=1)
 //
 // This test uses:
 //   - In-process P2P bus for message delivery
 //   - In-memory SQLite per party
-//   - Real ECDSA signing (Hardhat default accounts)
+//   - Real TSS signing (DKLs23 with real keyshares)
 //   - Real hash computation (must match Bridge.sol)
 // ============================================================================
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { ethers } from 'ethers';
 import { createP2PBus } from '../helpers/in-process-p2p.js';
 import { createTestDb } from '../helpers/test-db.js';
+import { getTestKeyshares, getTestGroupAddress, testTssSign } from '../helpers/tss-test-keyshares.js';
 import {
   PARTY_KEYS,
   MOCK_ZANO_TX_HASH,
   MOCK_TOKEN_ADDRESS,
-  THRESHOLD,
   TOTAL_PARTIES,
   TEST_CHAIN_ID,
 } from '../fixtures.js';
@@ -40,41 +38,36 @@ import { determineLeader, getSessionId, selectSigners } from '../../src/consensu
 import {
   computeErc20SignHash,
   computeNativeSignHash,
-  verifySignature,
-  formatSignaturesForContract,
 } from '../../src/evm-signer.js';
+import { initTss, formatEthSignature, computeRecoveryParam } from '../../src/tss.js';
+
+// ---- TSS test state ----
+let keyshares;
+let groupAddress;
 
 // ---- Per-test state ----
 let bus;
 let dbs;
+
+beforeAll(async () => {
+  keyshares = await getTestKeyshares();
+  groupAddress = await getTestGroupAddress();
+}, 60_000);
 
 beforeEach(() => {
   bus = createP2PBus(TOTAL_PARTIES);
   dbs = Array.from({ length: TOTAL_PARTIES }, () => createTestDb());
 });
 
-// ---- Helpers ----
-
-/** Sign an EVM hash with EIP-191 prefix (same as evm-signer.js signHash) */
-async function signEvmHash(hash, partyIndex) {
-  const wallet = new ethers.Wallet(PARTY_KEYS[partyIndex].privateKey);
-  const signature = await wallet.signMessage(ethers.getBytes(hash));
-  return { signature, signer: wallet.address };
-}
-
 // ============================================================================
-// Full Zano → EVM Flow
+// Full Zano → EVM Flow (TSS)
 // ============================================================================
 
-describe('Zano → EVM full bridge flow', () => {
+describe('Zano → EVM full bridge flow (TSS)', () => {
   it('3 parties sign an EVM withdrawal from a Zano burn', async () => {
     // ================================================================
     // STEP 1: Burn detected on Zano
     // ================================================================
-    //
-    // The Zano watcher polls for burn transactions via search_for_transactions.
-    // When it finds a burn with operation_type = 4 and a valid memo
-    // containing the destination EVM address, it creates a deposit record.
 
     const deposit = {
       sourceChain: 'zano',
@@ -87,7 +80,6 @@ describe('Zano → EVM full bridge flow', () => {
       destChain: 'evm',
     };
 
-    // All parties detect the burn
     for (let i = 0; i < TOTAL_PARTIES; i++) {
       dbs[i].addDeposit(deposit);
     }
@@ -99,7 +91,6 @@ describe('Zano → EVM full bridge flow', () => {
     const sessionId = getSessionId('evm', 0);
     const leaderId = determineLeader(sessionId);
 
-    // All parties agree on leader
     for (let i = 0; i < TOTAL_PARTIES; i++) {
       expect(determineLeader(sessionId)).toBe(leaderId);
     }
@@ -111,38 +102,28 @@ describe('Zano → EVM full bridge flow', () => {
     const leaderDeposit = dbs[leaderId].getPendingDeposits('evm')[0];
     dbs[leaderId].updateDepositStatus(leaderDeposit.id, 'processing');
 
-    // Simulate acceptor verification
     const acks = [];
     for (let i = 0; i < TOTAL_PARTIES; i++) {
       if (i === leaderId) continue;
 
-      // Each acceptor checks their own DB (simulating verifyZanoBurn)
       const found = dbs[i].getDepositByTxHash('zano', MOCK_ZANO_TX_HASH, 0);
-      expect(found).toBeDefined(); // All parties have it
-
+      expect(found).toBeDefined();
       acks.push({ sender: i, data: { accepted: true } });
     }
 
-    expect(acks.filter(a => a.data.accepted).length).toBeGreaterThanOrEqual(THRESHOLD - 1);
+    expect(acks.filter(a => a.data.accepted).length).toBeGreaterThanOrEqual(1);
 
     // ================================================================
-    // STEP 4: Select signers
+    // STEP 4: Select 2 signers for TSS
     // ================================================================
 
     const candidates = [leaderId, ...acks.map(a => a.sender)];
-    const signers = selectSigners(candidates, THRESHOLD, sessionId);
-    expect(signers).toHaveLength(THRESHOLD);
+    const signers = selectSigners(candidates, 2, sessionId);
+    expect(signers).toHaveLength(2);
 
     // ================================================================
-    // STEP 5: Compute EVM withdrawal hash
+    // STEP 5: Compute EVM withdrawal hash (deterministic, same for both signers)
     // ================================================================
-    //
-    // The hash encodes all withdrawal parameters. It must match what
-    // Bridge.sol's getERC20SignHash() computes internally during
-    // withdrawERC20(). Any mismatch = invalid signatures = stuck funds.
-    //
-    // For this test, we need to pad the Zano tx hash to bytes32.
-    // Real Zano tx hashes are 32 bytes (64 hex chars), but without 0x prefix.
 
     const isWrapped = true; // Wrapped token (minted by bridge on EVM)
     const txHashBytes32 = ethers.zeroPadBytes('0x' + MOCK_ZANO_TX_HASH, 32);
@@ -157,57 +138,48 @@ describe('Zano → EVM full bridge flow', () => {
       isWrapped,
     );
 
-    // Hash should be a valid bytes32
     expect(signHash).toMatch(/^0x[0-9a-f]{64}$/);
 
     // ================================================================
-    // STEP 6: Each signer signs the hash
+    // STEP 6: TSS signing — both signers cooperate via DKLs23
     // ================================================================
     //
-    // Uses EIP-191 personal sign: "\x19Ethereum Signed Message:\n32" + hash.
-    // This matches how Bridge.sol's _checkSignatures verifies:
-    //   signHash_.toEthSignedMessageHash().recover(signatures_[i])
+    // The hash goes through EIP-191 prefix before TSS signing, matching
+    // how Bridge.sol verifies: signHash_.toEthSignedMessageHash().recover(sig)
 
-    const collectedSigs = [];
+    const eip191Hash = ethers.hashMessage(ethers.getBytes(signHash));
+    const messageHash = ethers.getBytes(eip191Hash);
 
-    for (const signerId of signers) {
-      const sig = await signEvmHash(signHash, signerId);
+    const signer0Keyshare = keyshares[signers[0]];
+    const signer1Keyshare = keyshares[signers[1]];
 
-      // Verify each signature locally before sending
-      const valid = verifySignature(signHash, sig.signature, sig.signer);
-      expect(valid).toBe(true);
+    const { r, s } = await testTssSign(signer0Keyshare, signer1Keyshare, messageHash);
 
-      collectedSigs.push(sig);
-    }
-
-    expect(collectedSigs).toHaveLength(THRESHOLD);
+    expect(r.length).toBe(32);
+    expect(s.length).toBe(32);
 
     // ================================================================
-    // STEP 7: Exchange signatures via P2P
+    // STEP 7: Compute V and format as 65-byte EVM signature
     // ================================================================
-    //
-    // Each signer broadcasts their signature. The leader (or any party)
-    // collects threshold signatures.
 
-    // Signer 0 broadcasts to signer 1 (and vice versa)
-    for (const sig of collectedSigs) {
-      await bus.broadcast(
-        PARTY_KEYS.findIndex(p => p.address === sig.signer),
-        {
-          type: 'evm_signature',
-          sessionId,
-          data: { signature: sig.signature, signer: sig.signer },
-        },
-      );
-    }
+    const signature = formatEthSignature(r, s, messageHash, groupAddress);
+
+    // Verify it's a valid 65-byte hex signature
+    expect(signature).toMatch(/^0x[0-9a-f]{130}$/);
+
+    // Verify the signature recovers to the group address
+    const recovered = ethers.recoverAddress(eip191Hash, signature);
+    expect(recovered.toLowerCase()).toBe(groupAddress.toLowerCase());
 
     // ================================================================
-    // STEP 8: Update deposit status with collected signatures
+    // STEP 8: Store the single TSS signature
     // ================================================================
 
     for (const signerId of signers) {
       const myDeposit = dbs[signerId].getDepositByTxHash('zano', MOCK_ZANO_TX_HASH, 0);
-      dbs[signerId].updateDepositStatus(myDeposit.id, 'signed', collectedSigs);
+      dbs[signerId].updateDepositStatus(myDeposit.id, 'signed', [
+        { signature, signer: groupAddress },
+      ]);
     }
 
     // Verify final state
@@ -216,31 +188,22 @@ describe('Zano → EVM full bridge flow', () => {
       expect(finalDeposit.status).toBe('signed');
 
       const storedSigs = JSON.parse(finalDeposit.signatures);
-      expect(storedSigs).toHaveLength(THRESHOLD);
+      expect(storedSigs).toHaveLength(1); // Single TSS signature
+      expect(storedSigs[0].signer.toLowerCase()).toBe(groupAddress.toLowerCase());
     }
 
     // ================================================================
-    // STEP 9: Format signatures for on-chain withdrawal
+    // STEP 9: Signature is ready for on-chain withdrawal
     // ================================================================
     //
-    // The signatures are now ready to be passed to Bridge.sol's
-    // withdrawERC20(). This step would happen when someone submits
-    // the withdrawal transaction.
+    // The single TSS signature can be passed to Bridge.sol's
+    // withdrawERC20(). Contract threshold=1 so one sig suffices.
 
-    const contractSigs = formatSignaturesForContract(collectedSigs);
-    expect(contractSigs).toHaveLength(THRESHOLD);
+    expect(signature).toMatch(/^0x[0-9a-f]{130}$/);
+  }, 60_000);
 
-    // Each signature should be a 65-byte hex string (130 hex chars + 0x)
-    for (const sig of contractSigs) {
-      expect(sig).toMatch(/^0x[0-9a-f]{130}$/);
-    }
-  });
-
-  it('handles native ETH withdrawal (no token address)', async () => {
-    // ================================================================
+  it('handles native ETH withdrawal with TSS', async () => {
     // Same flow but for native ETH instead of ERC20.
-    // The hash computation is different (no token, no isWrapped).
-    // ================================================================
 
     const deposit = {
       sourceChain: 'zano',
@@ -258,7 +221,7 @@ describe('Zano → EVM full bridge flow', () => {
     }
 
     const sessionId = getSessionId('evm', 1);
-    const signers = selectSigners([0, 1, 2], THRESHOLD, sessionId);
+    const signers = selectSigners([0, 1, 2], 2, sessionId);
 
     // Native ETH uses computeNativeSignHash (no token, no isWrapped)
     const txHashBytes32 = ethers.zeroPadBytes('0x' + MOCK_ZANO_TX_HASH, 32);
@@ -270,72 +233,31 @@ describe('Zano → EVM full bridge flow', () => {
       TEST_CHAIN_ID,
     );
 
-    // Collect signatures from selected signers
-    const sigs = [];
-    for (const signerId of signers) {
-      const sig = await signEvmHash(signHash, signerId);
-      expect(verifySignature(signHash, sig.signature, sig.signer)).toBe(true);
-      sigs.push(sig);
-    }
+    // EIP-191 prefix for Bridge.sol compatibility
+    const eip191Hash = ethers.hashMessage(ethers.getBytes(signHash));
+    const messageHash = ethers.getBytes(eip191Hash);
 
-    // Verify we have enough signatures for the contract
-    expect(sigs).toHaveLength(THRESHOLD);
+    // TSS sign
+    const { r, s } = await testTssSign(keyshares[signers[0]], keyshares[signers[1]], messageHash);
 
-    // Format for contract
-    const contractSigs = formatSignaturesForContract(sigs);
-    for (const sig of contractSigs) {
-      expect(sig).toMatch(/^0x[0-9a-f]{130}$/);
-    }
-  });
+    // Format as 65-byte EVM signature
+    const signature = formatEthSignature(r, s, messageHash, groupAddress);
+    expect(signature).toMatch(/^0x[0-9a-f]{130}$/);
+
+    // Verify recovery
+    const recovered = ethers.recoverAddress(eip191Hash, signature);
+    expect(recovered.toLowerCase()).toBe(groupAddress.toLowerCase());
+  }, 60_000);
 });
 
 // ============================================================================
-// Signature Collection via P2P Bus
+// TSS Signature Verification
 // ============================================================================
 
-describe('signature collection via P2P', () => {
-  it('leader collects signatures from all signers', async () => {
-    // ================================================================
-    // Simulate the signature exchange step where each signer sends
-    // their signature to the leader, and the leader waits until
-    // it has collected enough (threshold - 1, since leader has its own).
-    // ================================================================
-
-    const leaderId = 0;
-    const sessionId = 'SIGN_evm_test';
-
-    // Leader starts waiting for 2 signatures from other parties
-    // (In real flow, leader already has its own signature, so it
-    //  waits for threshold - 1 from others. Here we collect from
-    //  all parties to test the bus.)
-    const waitPromise = bus.waitForMessage(leaderId, 'evm_signature', sessionId, 2);
-
-    // Party 1 sends their signature
-    await bus.sendToParty(1, leaderId, {
-      type: 'evm_signature',
-      sessionId,
-      data: { signature: '0xsig1', signer: PARTY_KEYS[1].address },
-    });
-
-    // Party 2 sends their signature
-    await bus.sendToParty(2, leaderId, {
-      type: 'evm_signature',
-      sessionId,
-      data: { signature: '0xsig2', signer: PARTY_KEYS[2].address },
-    });
-
-    const collected = await waitPromise;
-
-    expect(collected).toHaveLength(2);
-    expect(collected[0].data.signer).toBe(PARTY_KEYS[1].address);
-    expect(collected[1].data.signer).toBe(PARTY_KEYS[2].address);
-  });
-
-  it('cross-verification: all parties can verify each other\'s signatures', async () => {
-    // ================================================================
-    // Each party signs the same hash. Then every other party verifies.
-    // This ensures the signing scheme is consistent across parties.
-    // ================================================================
+describe('TSS signature properties', () => {
+  it('both signers produce identical (R, S)', async () => {
+    // This is fundamental to TSS: both parties independently arrive
+    // at the same signature. If they didn't, the protocol would fail.
 
     const hash = computeNativeSignHash(
       ethers.parseEther('1.0'),
@@ -345,26 +267,44 @@ describe('signature collection via P2P', () => {
       TEST_CHAIN_ID,
     );
 
-    // All 3 parties sign
-    const sigs = [];
-    for (let i = 0; i < TOTAL_PARTIES; i++) {
-      sigs.push(await signEvmHash(hash, i));
-    }
+    const eip191Hash = ethers.hashMessage(ethers.getBytes(hash));
+    const messageHash = ethers.getBytes(eip191Hash);
 
-    // Every party verifies every other party's signature
-    for (let verifier = 0; verifier < TOTAL_PARTIES; verifier++) {
-      for (let signer = 0; signer < TOTAL_PARTIES; signer++) {
-        const valid = verifySignature(hash, sigs[signer].signature, PARTY_KEYS[signer].address);
-        expect(valid).toBe(true);
+    // Sign with parties 0 and 1
+    const sig = await testTssSign(keyshares[0], keyshares[1], messageHash);
 
-        // Also check that cross-verification fails (signer A's sig != signer B)
-        if (signer !== verifier) {
-          const wrongValid = verifySignature(hash, sigs[signer].signature, PARTY_KEYS[verifier].address);
-          expect(wrongValid).toBe(false);
-        }
-      }
+    // R and S should be valid 32-byte values
+    expect(sig.r.length).toBe(32);
+    expect(sig.s.length).toBe(32);
+
+    // The signature should recover to the group address
+    const signature = formatEthSignature(sig.r, sig.s, messageHash, groupAddress);
+    const recovered = ethers.recoverAddress(eip191Hash, signature);
+    expect(recovered.toLowerCase()).toBe(groupAddress.toLowerCase());
+  }, 60_000);
+
+  it('any 2-of-3 combination can sign', async () => {
+    const hash = computeNativeSignHash(
+      ethers.parseEther('1.0'),
+      PARTY_KEYS[0].address,
+      '0x' + 'cd'.repeat(32),
+      0,
+      TEST_CHAIN_ID,
+    );
+
+    const eip191Hash = ethers.hashMessage(ethers.getBytes(hash));
+    const messageHash = ethers.getBytes(eip191Hash);
+
+    // Test all 3 combinations: [0,1], [0,2], [1,2]
+    const combos = [[0, 1], [0, 2], [1, 2]];
+
+    for (const [a, b] of combos) {
+      const sig = await testTssSign(keyshares[a], keyshares[b], messageHash);
+      const signature = formatEthSignature(sig.r, sig.s, messageHash, groupAddress);
+      const recovered = ethers.recoverAddress(eip191Hash, signature);
+      expect(recovered.toLowerCase()).toBe(groupAddress.toLowerCase());
     }
-  });
+  }, 120_000);
 });
 
 // ============================================================================
@@ -373,12 +313,6 @@ describe('signature collection via P2P', () => {
 
 describe('edge cases', () => {
   it('multiple deposits in queue are processed one at a time', () => {
-    // ================================================================
-    // When multiple burns happen on Zano before the bridge processes
-    // any, getPendingDeposits returns LIMIT 1 (oldest first).
-    // This ensures deposits are processed in order.
-    // ================================================================
-
     const deposit1 = {
       sourceChain: 'zano',
       txHash: MOCK_ZANO_TX_HASH,
@@ -404,27 +338,18 @@ describe('edge cases', () => {
     dbs[0].addDeposit(deposit1);
     dbs[0].addDeposit(deposit2);
 
-    // First query returns only deposit 1
     const first = dbs[0].getPendingDeposits('evm');
     expect(first).toHaveLength(1);
     expect(first[0].amount).toBe('1000');
 
-    // Process deposit 1
     dbs[0].updateDepositStatus(first[0].id, 'processing');
 
-    // Next query returns deposit 2
     const second = dbs[0].getPendingDeposits('evm');
     expect(second).toHaveLength(1);
     expect(second[0].amount).toBe('2000');
   });
 
   it('deposit status reset on consensus failure', () => {
-    // ================================================================
-    // If consensus fails (not enough ACKs), the leader resets the
-    // deposit from 'processing' back to 'pending' so it can be
-    // retried in the next session.
-    // ================================================================
-
     const deposit = {
       sourceChain: 'zano',
       txHash: MOCK_ZANO_TX_HASH,
@@ -438,17 +363,13 @@ describe('edge cases', () => {
 
     dbs[0].addDeposit(deposit);
 
-    // Leader moves to processing
     const d = dbs[0].getPendingDeposits('evm')[0];
     dbs[0].updateDepositStatus(d.id, 'processing');
 
-    // No pending deposits now
     expect(dbs[0].getPendingDeposits('evm')).toHaveLength(0);
 
-    // Consensus fails -> reset to pending
     dbs[0].updateDepositStatus(d.id, 'pending');
 
-    // Deposit is available again
     expect(dbs[0].getPendingDeposits('evm')).toHaveLength(1);
   });
 });

@@ -1,8 +1,11 @@
 // EVM Signing Module
 //
-// Produces ECDSA signatures for EVM bridge withdrawals.
-// In the PoC, each party signs with their own key (multi-sig).
-// In production, this would use TSS to produce a single threshold signature.
+// Produces ECDSA signatures for EVM bridge withdrawals using TSS.
+// Two parties cooperate via DKLs23 protocol to produce a single threshold
+// signature. No party ever holds the full private key.
+//
+// The contract verifies 1 signature from the TSS group address (threshold=1).
+// The 2-of-3 threshold is enforced off-chain by the TSS protocol.
 //
 // Bridgeless ref:
 //   tss-svc/internal/bridge/chain/evm/operations/ (hash computation)
@@ -10,6 +13,7 @@
 
 import { ethers } from 'ethers';
 import { config } from './config.js';
+import { distributedSign, formatEthSignature } from './tss.js';
 
 /**
  * Compute the ERC20 withdrawal sign hash.
@@ -45,37 +49,40 @@ export function computeNativeSignHash(amount, receiver, txHash, txNonce, chainId
 }
 
 /**
- * Sign a hash with this party's key.
- * Returns the signature in Ethereum format (65 bytes: r + s + v).
+ * Sign a hash using TSS cooperative signing.
+ * Returns the combined signature as a 65-byte EVM-compatible hex string.
  *
- * In the PoC: each party signs with their own ECDSA key.
- * In production (TSS): 2-of-3 parties run the GG18/GG20 signing protocol
- * and produce a single combined signature.
+ * The hash goes through EIP-191 prefix before TSS signing, matching how
+ * Bridge.sol verifies: signHash_.toEthSignedMessageHash().recover(sig)
  *
- * Bridgeless ref: tss-svc/internal/tss/signer.go Run()
+ * @param {string} hash          The sign hash (0x-prefixed keccak256)
+ * @param {Function} sendMsg     P2P send function for TSS rounds
+ * @param {Function} waitForMsgs P2P receive function for TSS rounds
+ * @returns {{ signature: string, signer: string }}
  */
-export async function signHash(hash) {
-  if (!config.partyKeys) {
-    throw new Error('Party keys not loaded. Run keygen.js first.');
+export async function signHash(hash, sendMsg, waitForMsgs) {
+  if (!config.tssKeyshare) {
+    throw new Error('TSS keyshare not loaded. Run keygen.js first.');
+  }
+  if (!config.tssGroupAddress) {
+    throw new Error('TSS group address not set. Initialize TSS first.');
   }
 
-  const myKey = config.partyKeys[config.partyId];
-  if (!myKey) {
-    throw new Error(`No key found for party ${config.partyId}`);
-  }
-
-  const wallet = new ethers.Wallet(myKey.privateKey);
-
-  // Sign with EIP-191 prefix (\x19Ethereum Signed Message:\n32)
-  // This matches how Signers.sol verifies:
+  // EIP-191 prefix: \x19Ethereum Signed Message:\n32 + hash
+  // This matches what Bridge.sol's _checkSignatures() expects:
   //   signHash_.toEthSignedMessageHash().recover(signatures_[i])
-  //
-  // Bridgeless ref: bridge-contracts/contracts/utils/Signers.sol _checkSignatures()
-  const signature = await wallet.signMessage(ethers.getBytes(hash));
+  const eip191Hash = ethers.hashMessage(ethers.getBytes(hash));
+  const messageHash = ethers.getBytes(eip191Hash);
+
+  // Run TSS signing protocol (6 rounds with co-signer)
+  const { r, s } = await distributedSign(config.tssKeyshare, messageHash, sendMsg, waitForMsgs);
+
+  // Compute V by trial recovery and format as 65-byte signature
+  const signature = formatEthSignature(r, s, messageHash, config.tssGroupAddress);
 
   return {
     signature,
-    signer: wallet.address,
+    signer: config.tssGroupAddress,
   };
 }
 
@@ -90,9 +97,13 @@ export function resolveEvmTokenAddress(tokenAddress) {
 
 /**
  * Sign a deposit for EVM withdrawal (Zano -> EVM direction).
- * Computes the hash and signs it.
+ * Computes the hash and signs it via TSS.
+ *
+ * @param {Object} deposit    The deposit record
+ * @param {Function} sendMsg  P2P send function for TSS rounds
+ * @param {Function} waitForMsgs P2P receive function for TSS rounds
  */
-export async function signEvmWithdrawal(deposit) {
+export async function signEvmWithdrawal(deposit, sendMsg, waitForMsgs) {
   const isWrapped = false; // Custody model: bridge releases locked dEURO
 
   // Map Zano asset ID to EVM token address
@@ -111,22 +122,5 @@ export async function signEvmWithdrawal(deposit) {
   console.log(`[EVM Signer] Signing hash: ${hash}`);
   console.log(`[EVM Signer] Token: ${evmTokenAddress} (mapped from ${deposit.token_address})`);
 
-  return signHash(hash);
-}
-
-/**
- * Verify a signature from another party.
- */
-export function verifySignature(hash, signature, expectedSigner) {
-  const messageHash = ethers.hashMessage(ethers.getBytes(hash));
-  const recovered = ethers.recoverAddress(messageHash, signature);
-  return recovered.toLowerCase() === expectedSigner.toLowerCase();
-}
-
-/**
- * Format signatures for the Bridge.sol withdrawERC20 call.
- * The contract expects an array of 65-byte signatures.
- */
-export function formatSignaturesForContract(signatures) {
-  return signatures.map(s => s.signature);
+  return signHash(hash, sendMsg, waitForMsgs);
 }

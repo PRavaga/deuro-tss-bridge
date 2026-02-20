@@ -4,14 +4,14 @@
 //
 // Shared test data used across unit, contract, and integration tests.
 //
-// The 3 Hardhat default accounts serve as our TSS parties:
-//   - Party 0: Account #0 (deployer + signer)
-//   - Party 1: Account #1
-//   - Party 2: Account #2
+// TSS Architecture:
+// - DKG produces keyshares for 3 parties, all sharing the same group public key
+// - Any 2-of-3 can cooperate to produce a single ECDSA signature
+// - Contract deploys with [groupAddress] and threshold=1
+// - Test keyshares are generated lazily via helpers/tss-test-keyshares.js
 //
-// We use Hardhat's deterministic accounts so tests are reproducible
-// without generating random keys. These are the same accounts you'd get
-// from `npx hardhat node`.
+// For contract tests (Hardhat network), we still use Hardhat's default accounts
+// for gas payment, but signatures come from the TSS group address.
 // ============================================================================
 
 import { ethers } from 'ethers';
@@ -19,32 +19,32 @@ import { ethers } from 'ethers';
 // ---------------------------------------------------------------------------
 // Hardhat default accounts (mnemonic: "test test test test test test test test
 // test test test junk"). These are pre-funded with 10,000 ETH on the local
-// Hardhat network.
+// Hardhat network. Used for contract deployment and gas payment.
 // ---------------------------------------------------------------------------
 
-export const PARTY_KEYS = [
+export const HARDHAT_ACCOUNTS = [
   {
     id: 0,
-    name: 'Party A',
-    // Hardhat account #0
+    name: 'Account 0 (deployer)',
     privateKey: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
     address: '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266',
   },
   {
     id: 1,
-    name: 'Party B',
-    // Hardhat account #1
+    name: 'Account 1',
     privateKey: '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d',
     address: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
   },
   {
     id: 2,
-    name: 'Party C',
-    // Hardhat account #2
+    name: 'Account 2',
     privateKey: '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a',
     address: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
   },
 ];
+
+// Backwards-compat alias: some tests reference PARTY_KEYS for Hardhat account usage
+export const PARTY_KEYS = HARDHAT_ACCOUNTS;
 
 // ---------------------------------------------------------------------------
 // Fake transaction hashes and Zano addresses for deposit simulation.
@@ -93,7 +93,7 @@ export const EVM_TO_ZANO_DEPOSIT = {
   txNonce: 0,
   tokenAddress: ZERO_ADDRESS,
   amount: ethers.parseEther('1.5').toString(), // "1500000000000000000"
-  sender: PARTY_KEYS[0].address,
+  sender: HARDHAT_ACCOUNTS[0].address,
   receiver: MOCK_ZANO_ADDRESS,
   destChain: 'zano',
 };
@@ -106,7 +106,7 @@ export const ZANO_TO_EVM_DEPOSIT = {
   tokenAddress: MOCK_TOKEN_ADDRESS,
   amount: '1000000000000', // 1M tokens with 6 decimals
   sender: '',
-  receiver: PARTY_KEYS[1].address, // Destination EVM address
+  receiver: HARDHAT_ACCOUNTS[1].address, // Destination EVM address
   destChain: 'evm',
 };
 
@@ -149,7 +149,7 @@ export const MOCK_SEARCH_TX_RESPONSE = {
         {
           body: Buffer.from(
             JSON.stringify({
-              dst_add: PARTY_KEYS[1].address,
+              dst_add: HARDHAT_ACCOUNTS[1].address,
               dst_net_id: 'evm',
               referral_id: 0,
             })
@@ -172,5 +172,10 @@ export const MOCK_HEIGHT_RESPONSE = {
 // ---------------------------------------------------------------------------
 
 export const TEST_CHAIN_ID = 31337; // Hardhat default chain ID
-export const THRESHOLD = 2;
+
+// TSS: contract threshold=1 (single group signature)
+// The 2-of-3 threshold is enforced off-chain by DKLs23
+export const THRESHOLD = 1;
+
+// TSS parties count
 export const TOTAL_PARTIES = 3;

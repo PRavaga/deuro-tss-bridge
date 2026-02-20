@@ -2,23 +2,18 @@
 // Unit Tests: EVM Signer Module
 // ============================================================================
 //
-// Tests for the pure signing functions in src/evm-signer.js:
+// Tests for the functions in src/evm-signer.js:
 //   - computeErc20SignHash(token, amount, receiver, txHash, txNonce, chainId, isWrapped)
 //   - computeNativeSignHash(amount, receiver, txHash, txNonce, chainId)
-//   - verifySignature(hash, signature, expectedSigner)
-//   - formatSignaturesForContract(signatures)
+//   - resolveEvmTokenAddress(tokenAddress)
 //
 // The hash functions are the most critical part of the bridge. They MUST
 // produce byte-for-byte identical output to Bridge.sol's getERC20SignHash()
 // and getNativeSignHash(). If there's any mismatch, the on-chain signature
 // verification will reject valid signatures and funds get stuck.
 //
-// We test:
-//   1. Hash computation matches expected values
-//   2. Sign + verify round-trip works
-//   3. Signature format is correct for the contract
-//   4. Wrong signer is detected
-//   5. Tampered hash is detected
+// TSS-specific signing tests (signHash, signEvmWithdrawal) are in the
+// integration tests where the full DKLs23 protocol can run with real keyshares.
 // ============================================================================
 
 import { describe, it, expect } from 'vitest';
@@ -26,18 +21,9 @@ import { ethers } from 'ethers';
 import {
   computeErc20SignHash,
   computeNativeSignHash,
-  verifySignature,
-  formatSignaturesForContract,
   resolveEvmTokenAddress,
 } from '../../src/evm-signer.js';
 import { PARTY_KEYS, MOCK_EVM_TX_HASH, MOCK_TOKEN_ADDRESS, TEST_CHAIN_ID } from '../fixtures.js';
-
-// Helper: sign a hash with a specific party's key (standalone, no config dependency)
-async function signWithParty(hash, partyIndex) {
-  const wallet = new ethers.Wallet(PARTY_KEYS[partyIndex].privateKey);
-  const signature = await wallet.signMessage(ethers.getBytes(hash));
-  return { signature, signer: wallet.address };
-}
 
 // ============================================================================
 // computeErc20SignHash
@@ -152,131 +138,6 @@ describe('computeNativeSignHash', () => {
     const manualHash = ethers.keccak256(manualEncoded);
 
     expect(computeNativeSignHash(amount, receiver, txHash, txNonce, chainId)).toBe(manualHash);
-  });
-});
-
-// ============================================================================
-// verifySignature
-// ============================================================================
-
-describe('verifySignature', () => {
-  // verifySignature recovers the signer from an EIP-191 signed message
-  // and checks it matches the expected address. This is the off-chain
-  // equivalent of Bridge.sol's _checkSignatures().
-
-  it('returns true for a valid signature', async () => {
-    const hash = computeNativeSignHash(
-      ethers.parseEther('1.0'),
-      PARTY_KEYS[0].address,
-      MOCK_EVM_TX_HASH,
-      0,
-      TEST_CHAIN_ID,
-    );
-
-    // Sign with party 0's key
-    const { signature } = await signWithParty(hash, 0);
-
-    // Verify should succeed
-    const valid = verifySignature(hash, signature, PARTY_KEYS[0].address);
-    expect(valid).toBe(true);
-  });
-
-  it('returns false for wrong signer', async () => {
-    const hash = computeNativeSignHash(
-      ethers.parseEther('1.0'),
-      PARTY_KEYS[0].address,
-      MOCK_EVM_TX_HASH,
-      0,
-      TEST_CHAIN_ID,
-    );
-
-    // Sign with party 0's key
-    const { signature } = await signWithParty(hash, 0);
-
-    // But check against party 1's address -- should fail
-    const valid = verifySignature(hash, signature, PARTY_KEYS[1].address);
-    expect(valid).toBe(false);
-  });
-
-  it('returns false for tampered hash', async () => {
-    const hash = computeNativeSignHash(
-      ethers.parseEther('1.0'),
-      PARTY_KEYS[0].address,
-      MOCK_EVM_TX_HASH,
-      0,
-      TEST_CHAIN_ID,
-    );
-
-    const { signature } = await signWithParty(hash, 0);
-
-    // Create a different hash by changing the amount
-    const tamperedHash = computeNativeSignHash(
-      ethers.parseEther('999.0'), // different amount!
-      PARTY_KEYS[0].address,
-      MOCK_EVM_TX_HASH,
-      0,
-      TEST_CHAIN_ID,
-    );
-
-    // Signature was for the original hash, not the tampered one
-    const valid = verifySignature(tamperedHash, signature, PARTY_KEYS[0].address);
-    expect(valid).toBe(false);
-  });
-
-  it('works for all 3 parties', async () => {
-    const hash = computeErc20SignHash(
-      MOCK_TOKEN_ADDRESS,
-      ethers.parseEther('1.0'),
-      PARTY_KEYS[0].address,
-      MOCK_EVM_TX_HASH,
-      0,
-      TEST_CHAIN_ID,
-      true,
-    );
-
-    // Each party signs the same hash -- all should verify against their own address
-    for (let i = 0; i < 3; i++) {
-      const { signature } = await signWithParty(hash, i);
-      const valid = verifySignature(hash, signature, PARTY_KEYS[i].address);
-      expect(valid).toBe(true);
-    }
-  });
-});
-
-// ============================================================================
-// formatSignaturesForContract
-// ============================================================================
-
-describe('formatSignaturesForContract', () => {
-  // Bridge.sol expects an array of raw signature bytes.
-  // This function strips the signer metadata and returns just the signatures.
-
-  it('extracts signature bytes from signer objects', () => {
-    const input = [
-      { signature: '0xaabb', signer: PARTY_KEYS[0].address },
-      { signature: '0xccdd', signer: PARTY_KEYS[1].address },
-    ];
-
-    const result = formatSignaturesForContract(input);
-
-    expect(result).toEqual(['0xaabb', '0xccdd']);
-  });
-
-  it('returns empty array for empty input', () => {
-    expect(formatSignaturesForContract([])).toEqual([]);
-  });
-
-  it('preserves signature order', () => {
-    // Order matters because _checkSignatures() doesn't sort --
-    // it just iterates and checks each one.
-    const input = [
-      { signature: '0x111', signer: 'a' },
-      { signature: '0x222', signer: 'b' },
-      { signature: '0x333', signer: 'c' },
-    ];
-
-    const result = formatSignaturesForContract(input);
-    expect(result).toEqual(['0x111', '0x222', '0x333']);
   });
 });
 

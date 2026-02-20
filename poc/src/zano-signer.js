@@ -1,20 +1,22 @@
 // Zano Signing Module
 //
-// Handles signing and broadcasting Zano asset transactions.
+// Handles signing and broadcasting Zano asset transactions using TSS.
 // For EVM -> Zano direction: creates emit (mint) transaction, signs with TSS, broadcasts.
+//
+// With TSS, 2-of-3 parties cooperate to produce a single ECDSA signature.
+// The combined (R, S) is sent to Zano as r+s hex (no recovery byte V).
 //
 // Bridgeless ref:
 //   tss-svc/internal/tss/session/signing/zano/session.go (signing session)
 //   tss-svc/internal/tss/session/signing/zano/finalizer.go (broadcast)
 //   tss-svc/pkg/zano/utils.go (signature encoding)
 
-import { ethers } from 'ethers';
 import { config } from './config.js';
+import { distributedSign, formatZanoSignature } from './tss.js';
 import {
   emitAsset,
   sendExtSignedAssetTx,
   formSigningData,
-  encodeSignatureForZano,
 } from './zano-rpc.js';
 
 /**
@@ -45,59 +47,42 @@ export async function createUnsignedEmitTx(assetId, receiverAddress, amount) {
 }
 
 /**
- * Sign the Zano transaction hash with this party's key.
+ * Sign the Zano transaction hash using TSS cooperative signing.
  *
- * In the PoC: signs with the party's ECDSA key directly.
- * In production: 2-of-3 TSS signing produces a single combined signature.
+ * 2-of-3 parties run the DKLs23 signing protocol to produce a single
+ * combined ECDSA signature. No party ever holds the full private key.
  *
- * The message to sign is the raw transaction ID bytes.
+ * The message to sign is the raw transaction ID bytes (32-byte hash).
+ * No keccak256 or Ethereum prefix — the tx_id IS the digest.
  *
- * Bridgeless ref:
- *   tss-svc/pkg/zano/utils.go FormSigningData() -- forms the message
- *   tss-svc/internal/tss/signer.go Run() -- TSS signing
+ * @param {Buffer|Uint8Array} sigData  The 32-byte tx_id to sign
+ * @param {Function} sendMsg           P2P send for TSS rounds
+ * @param {Function} waitForMsgs       P2P receive for TSS rounds
+ * @returns {{ r: Uint8Array, s: Uint8Array, zanoSig: string }}
  */
-export async function signZanoTxHash(sigData) {
-  if (!config.partyKeys) {
-    throw new Error('Party keys not loaded. Run keygen.js first.');
+export async function signZanoTxHash(sigData, sendMsg, waitForMsgs) {
+  if (!config.tssKeyshare) {
+    throw new Error('TSS keyshare not loaded. Run keygen.js first.');
   }
 
-  const myKey = config.partyKeys[config.partyId];
-  if (!myKey) {
-    throw new Error(`No key found for party ${config.partyId}`);
-  }
-
-  // Create wallet from party's key
-  const wallet = new ethers.Wallet(myKey.privateKey);
-
-  // Zano expects the raw tx_id (32-byte hash) to be signed directly with ECDSA.
-  // No keccak256 or Ethereum prefix — the tx_id IS the digest.
-  //
-  // Ref: zano/utils/JS/test_eth_sig.js:
-  //   const bytesToSign = ethers.getBytes('0x' + verified_tx_id);
-  //   const signature = wallet.signingKey.sign(bytesToSign).serialized;
-  const signingKey = new ethers.SigningKey(myKey.privateKey);
-
-  // sigData may arrive as a serialized Buffer object ({ type: "Buffer", data: [...] })
-  // after JSON transport through P2P. Normalize it to Uint8Array.
+  // Normalize sigData to Uint8Array
   let normalizedSigData;
   if (sigData && sigData.type === 'Buffer' && Array.isArray(sigData.data)) {
     normalizedSigData = new Uint8Array(sigData.data);
   } else if (typeof sigData === 'string') {
-    normalizedSigData = ethers.getBytes('0x' + sigData.replace(/^0x/, ''));
+    normalizedSigData = new Uint8Array(Buffer.from(sigData.replace(/^0x/, ''), 'hex'));
   } else {
-    normalizedSigData = sigData;
+    normalizedSigData = new Uint8Array(sigData);
   }
 
-  // Sign the raw 32-byte tx_id directly (it IS the digest, no additional hashing)
-  const sig = signingKey.sign(normalizedSigData);
+  // Run TSS signing protocol (6 rounds with co-signer)
+  // sigData IS the digest — Zano signs the raw tx_id directly
+  const { r, s } = await distributedSign(config.tssKeyshare, normalizedSigData, sendMsg, waitForMsgs);
 
-  return {
-    signature: sig.serialized,           // 65 bytes: r + s + v
-    r: sig.r,
-    s: sig.s,
-    v: sig.v,
-    signer: wallet.address,
-  };
+  // Format for Zano: r+s hex (128 chars, no V, no 0x prefix)
+  const zanoSig = formatZanoSignature(r, s);
+
+  return { r, s, zanoSig };
 }
 
 /**
@@ -106,16 +91,10 @@ export async function signZanoTxHash(sigData) {
  *
  * Bridgeless ref: tss-svc/internal/tss/session/signing/zano/finalizer.go Finalize()
  *
- * Flow:
- * 1. Encode the TSS signature for Zano format
- * 2. Call send_ext_signed_asset_tx with the unsigned tx, finalized tx, and signature
- * 3. Zano wallet applies the signature and broadcasts
+ * @param {Object} unsignedTxData  From createUnsignedEmitTx()
+ * @param {string} zanoSig         r+s hex from TSS signing (128 chars)
  */
-export async function broadcastSignedZanoTx(unsignedTxData, signature) {
-  // Encode signature for Zano's format
-  // Bridgeless ref: tss-svc/pkg/zano/utils.go EncodeSignature()
-  const zanoSig = encodeSignatureForZano(signature);
-
+export async function broadcastSignedZanoTx(unsignedTxData, zanoSig) {
   console.log(`[Zano Signer] Broadcasting signed tx: ${unsignedTxData.txId}`);
 
   const result = await sendExtSignedAssetTx(
@@ -135,12 +114,15 @@ export async function broadcastSignedZanoTx(unsignedTxData, signature) {
 
 /**
  * Full Zano signing flow for a single deposit (EVM -> Zano).
- *
- * This is the leader's perspective. Non-leaders just sign and return.
+ * Leader creates unsigned tx, both signers run TSS, leader broadcasts.
  *
  * Bridgeless ref: tss-svc/internal/tss/session/signing/zano/session.go runSession()
+ *
+ * @param {Object} deposit       The deposit to process
+ * @param {Function} sendMsg     P2P send for TSS rounds
+ * @param {Function} waitForMsgs P2P receive for TSS rounds
  */
-export async function processZanoWithdrawal(deposit) {
+export async function processZanoWithdrawal(deposit, sendMsg, waitForMsgs) {
   const assetId = config.zano.assetId;
   const receiver = deposit.receiver;
   const amount = deposit.amount;
@@ -148,12 +130,12 @@ export async function processZanoWithdrawal(deposit) {
   // 1. Create unsigned transaction
   const unsignedTxData = await createUnsignedEmitTx(assetId, receiver, amount);
 
-  // 2. Sign the tx hash
-  const mySig = await signZanoTxHash(unsignedTxData.sigData);
+  // 2. Sign the tx hash via TSS
+  const tssSig = await signZanoTxHash(unsignedTxData.sigData, sendMsg, waitForMsgs);
 
-  // Return signing data for consensus exchange
+  // Return signing data for broadcast
   return {
     unsignedTxData,
-    signature: mySig,
+    zanoSig: tssSig.zanoSig,
   };
 }

@@ -1,36 +1,57 @@
-// Deploy DeuroBridge to Sepolia testnet
+// Deploy DeuroBridge to Sepolia testnet (TSS mode)
+//
+// TSS deployment: single group address, threshold=1.
+// The 2-of-3 threshold is enforced off-chain by the DKLs23 protocol.
 //
 // Usage:
 //   npx hardhat run scripts/deploy.js --network sepolia
 //
 // Prerequisites:
-//   1. Run `node src/keygen.js` first to generate party keys
+//   1. Run DKG ceremony first: PARTY_ID=x node src/keygen.js (all 3 parties)
 //   2. Set DEPLOYER_PRIVATE_KEY in .env or environment
 //   3. Fund the deployer account with Sepolia ETH
 
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 async function main() {
-  // Load party keys
-  const keysPath = join(__dirname, '..', 'data', 'party-keys.json');
-  let partyKeys;
-  try {
-    partyKeys = JSON.parse(readFileSync(keysPath, 'utf8'));
-  } catch {
-    console.error('Party keys not found. Run `node src/keygen.js` first.');
+  // Load any keyshare to derive the group address (all keyshares produce the same address)
+  let keyshareFile = null;
+  for (let i = 0; i < 3; i++) {
+    const path = join(__dirname, '..', 'data', `keyshare-${i}.bin`);
+    if (existsSync(path)) {
+      keyshareFile = path;
+      break;
+    }
+  }
+
+  if (!keyshareFile) {
+    console.error('No keyshare files found. Run DKG ceremony first:');
+    console.error('  PARTY_ID=0 node src/keygen.js  (terminal 1)');
+    console.error('  PARTY_ID=1 node src/keygen.js  (terminal 2)');
+    console.error('  PARTY_ID=2 node src/keygen.js  (terminal 3)');
     process.exit(1);
   }
 
-  const signerAddresses = partyKeys.map(p => p.address);
-  const threshold = 2; // 2-of-3
+  // Initialize WASM and derive group address
+  const { initTss, getGroupAddress } = await import('../src/tss.js');
+  await initTss();
 
-  console.log('Deploying DeuroBridge...');
-  console.log(`  Signers: ${signerAddresses.join(', ')}`);
-  console.log(`  Threshold: ${threshold}`);
+  const keyshareBytes = readFileSync(keyshareFile);
+  const groupAddress = getGroupAddress(keyshareBytes);
+
+  // TSS: single signer (group address), threshold=1
+  // The 2-of-3 threshold is enforced by the DKLs23 protocol off-chain
+  const signerAddresses = [groupAddress];
+  const threshold = 1;
+
+  console.log('Deploying DeuroBridge (TSS mode)...');
+  console.log(`  Group Address: ${groupAddress}`);
+  console.log(`  Signers: [${groupAddress}]`);
+  console.log(`  On-chain Threshold: ${threshold} (TSS enforces 2-of-3 off-chain)`);
   console.log();
 
   const DeuroBridge = await ethers.getContractFactory('DeuroBridge');

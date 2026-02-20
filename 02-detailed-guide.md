@@ -19,7 +19,7 @@
 
 ## 1. Cryptographic foundation
 
-### 1.1 Threshold ECDSA (GG18/GG20)
+### 1.1 Threshold ECDSA (DKLs23)
 
 The bridge uses threshold ECDSA on secp256k1 -- the same curve Ethereum uses, and the one Zano accepts for external asset signatures.
 
@@ -28,19 +28,24 @@ Parameters for 2-of-3:
 - `T = 2` (threshold -- minimum parties to sign)
 - `f = N - (T+1) = 0` (max tolerated Byzantine parties for liveness)
 
-The protocol is Gennaro & Goldfeder (2018/2020), implemented in `bnb-chain/tss-lib`. It runs in multiple rounds:
+The PoC implements DKLs23 via `@silencelaboratories/dkls-wasm-ll-node` v1.2.0 (Rust compiled to WASM, Trail of Bits audited April 2024). The production Bridgeless system uses GG19 via `bnb-chain/tss-lib` (Go). Both produce standard secp256k1 ECDSA signatures.
 
-Keygen (9 rounds):
-1. Each party generates a Paillier keypair and safe primes (pre-parameters)
-2. Parties exchange commitments and Shamir secret shares
-3. Zero-knowledge proofs validate each party's contribution
-4. Each party ends up with a `LocalPartySaveData` containing their key share
+DKG (5 rounds, all 3 parties):
+1. `createFirstMessage()` → broadcast
+2. `handleMessages(filter(msg1))` → P2P directed messages
+3. `calculateChainCodeCommitment()` + `handleMessages(select(msg2))` → P2P directed
+4. `handleMessages(select(msg3), commitments)` → broadcast
+5. `handleMessages(filter(msg4))` → finalize, extract keyshare
 
-Signing (9 rounds):
-1. Parties exchange MtA (Multiplicative-to-Additive) shares
-2. Range proofs check that shares are well-formed
-3. Partial signatures combine into a final (R, S) ECDSA signature
-4. Output: standard 65-byte ECDSA signature (r, s, v)
+Signing (6 rounds, 2-of-3 parties):
+1. `createFirstMessage()` → broadcast to co-signer
+2. `handleMessages(filter(msg1))` → P2P
+3. `handleMessages(select(msg2))` → P2P
+4. `handleMessages(select(msg3))` → pre-signature computed internally
+5. `lastMessage(messageHash)` → broadcast
+6. `combine(filter(msg4))` → `[R, S]` (both Uint8Array(32))
+
+Output: standard 32-byte R + 32-byte S. No V -- compute by trial `ecrecover` with v=27 and v=28.
 
 ### 1.2 Why TSS, not multisig
 
@@ -50,34 +55,31 @@ Signing (9 rounds):
 | Gas cost | Low (1 ecrecover) | High (N ecrecovers) |
 | Zano compatibility | Works via `send_ext_signed_asset_tx` | Not supported natively |
 | Privacy | Indistinguishable from normal tx | Reveals threshold scheme |
+| Zano security | 2-of-3 cooperative signing | Only leader signs (1-of-1) |
 
-### 1.3 PoC approach
+The Zano side is the key motivation: Zano's `send_ext_signed_asset_tx` accepts exactly one ECDSA signature. With multi-sig, only the leader signs -- making the Zano side effectively 1-of-1 (a single rogue party can mint tokens). TSS fixes this by requiring 2-of-3 cooperation for every signature.
 
-The PoC uses individual ECDSA keys per party with on-chain 2-of-3 multi-sig verification. The consensus, watchers, chain clients, and security logic are identical to production. Upgrading to TSS only changes the signing layer.
+### 1.3 WASM memory model
 
-| Aspect | PoC | Production |
-|--------|-----|-----------|
-| Signing | Individual ECDSA (multi-sig) | GG19 TSS (bnb-chain/tss-lib) |
-| On-chain threshold | 2 (needs 2 individual sigs) | 1 (TSS produces 1 combined sig) |
-| P2P | HTTP + API key | gRPC + mutual TLS |
-| Broadcast | Simple HTTP | Dolev-Strong reliable broadcast |
-| Finalization | Leader auto-submits | Separate relayer service |
-| Key storage | JSON file | HashiCorp Vault |
+The DKLs23 library uses WASM heap memory:
+- `handleMessages()` and `combine()` take ownership of input `Message` objects (free them internally). Do NOT call `.free()` after passing messages to these methods.
+- `SignSession` constructor consumes the `Keyshare` -- always reload from bytes.
+- Output messages from `handleMessages()` are new allocations -- serialize before the next round.
+- `filterMessages(msgs, party)` = `msgs.filter(m => m.from_id !== party).map(m => m.clone())`
+- `selectMessages(msgs, party)` = `msgs.filter(m => m.to_id === party).map(m => m.clone())`
 
-### 1.4 Pre-parameters (production)
+### 1.4 Production comparison
 
-Before keygen, each party generates pre-parameters:
-- Two safe primes (p, q where p = 2p'+1, q = 2q'+1)
-- A Paillier keypair derived from these primes
-- Takes 30-60 seconds per party
+| Aspect | PoC (DKLs23) | Production (GG19) |
+|--------|-------------|-------------------|
+| Library | `@silencelaboratories/dkls-wasm-ll-node` | `bnb-chain/tss-lib` |
+| Language | Rust → WASM → Node.js | Go |
+| DKG rounds | 5 | 9 |
+| Signing rounds | 6 | 9 |
+| Pre-parameters | None | Paillier keypair + safe primes |
+| Audit | Trail of Bits (April 2024) | Multiple audits |
 
-Bridgeless ref: `tss-svc/cmd/helpers/generate/preparams.go`
-```go
-params, _ := keygen.GeneratePreParams(10 * time.Minute)
-params.ValidateWithProof()  // Validates Paillier key integrity
-```
-
-Generate once, store securely. They're reusable across multiple keygen ceremonies.
+Both produce identical output: standard secp256k1 ECDSA (R, S) signatures.
 
 ---
 
@@ -144,11 +146,10 @@ EVM (Sepolia)                          Zano (Testnet)
 │  └──────────────┬────────────────┘               │
 │                 │                                  │
 │  ┌──────────────▼────────────────┐               │
-│  │     Signing Engine            │               │
-│  │  - ECDSA per party (PoC)     │               │
-│  │  - Signature verification     │               │
-│  │  - Deduplication + relay      │               │
-│  │    rejection                  │               │
+│  │     TSS Signing Engine        │               │
+│  │  - DKLs23 via WASM           │               │
+│  │  - Multi-round P2P protocol  │               │
+│  │  - Single combined signature │               │
 │  └──────────────┬────────────────┘               │
 │                 │                                  │
 │  ┌──────────────▼────────────────┐               │
@@ -161,6 +162,7 @@ EVM (Sepolia)                          Zano (Testnet)
 │  │     P2P Layer (HTTP)          │               │
 │  │  - Broadcast messages         │               │
 │  │  - Direct send                │               │
+│  │  - TSS round messages         │               │
 │  └───────────────────────────────┘               │
 └──────────────────────────────────────────────────┘
 ```
@@ -179,82 +181,65 @@ A signing session goes through these phases:
   │     ├─ Leader: propose pending deposit
   │     ├─ Acceptors: independently verify on-chain (Paper Algo 5)
   │     ├─ Acceptors: send ACK/NACK
-  │     └─ Leader: select signers (THRESHOLD from acceptors + self)
+  │     └─ Leader: select 2 signers from acceptors + self
   │
-  ├─ 3. Signing (15 seconds)
-  │     ├─ Each signer signs with their ECDSA key (PoC)
-  │     ├─ Signatures verified before collection (Algo 6, L9-10)
-  │     ├─ Self-signature relay rejection
-  │     └─ Signer deduplication via Set
+  ├─ 3. TSS Signing (30 seconds)
+  │     ├─ Both signers compute hash (deterministic)
+  │     ├─ Both run DKLs23 protocol (6 rounds P2P exchange)
+  │     └─ Both arrive at identical (R, S) signature
   │
   ├─ 4. Finalization
   │     ├─ Status guard: only PROCESSING/PENDING (Algo 7, L2)
-  │     ├─ EVM: leader submits withdrawERC20() on-chain
-  │     ├─ Zano: leader broadcasts via send_ext_signed_asset_tx
+  │     ├─ EVM: leader computes V, formats 65-byte sig, submits on-chain
+  │     ├─ Zano: leader encodes R+S as hex, broadcasts via Zano RPC
   │     └─ Error: revert to PENDING for retry (Theorem 1 liveness)
   │
   └─ 5. Next session
 ```
 
-PoC timing: 60s session interval, 10s consensus, 15s signing.
+PoC timing: 60s session interval, 10s consensus, 30s signing.
 Go timing: 5s/15s/13s/5s/7s phases.
 
 ---
 
 ## 3. Key generation
 
-### 3.1 PoC keygen
+### 3.1 Distributed DKG ceremony
 
-The PoC generates 3 independent ECDSA keypairs. No TSS ceremony needed.
+All 3 parties run `keygen.js` simultaneously. Each party participates in a DKLs23 distributed key generation ceremony via P2P message exchange.
 
 ```bash
-node src/keygen.js
+# Run all 3 in separate terminals simultaneously:
+PARTY_ID=0 node src/keygen.js
+PARTY_ID=1 node src/keygen.js
+PARTY_ID=2 node src/keygen.js
 ```
 
-This creates `data/party-keys.json`:
-```json
-[
-  {
-    "privateKey": "0x...",
-    "publicKey": "0x04...",
-    "address": "0x..."
-  },
-  // ... party 1, party 2
-]
+This creates binary keyshare files:
+```
+data/keyshare-0.bin
+data/keyshare-1.bin
+data/keyshare-2.bin
 ```
 
-The addresses derived from these keys are registered as signers on DeuroBridge.sol. Party A's key is also the Zano asset owner.
+Each keyshare file contains the party's secret share. All 3 keyshares encode the same group public key.
 
-### 3.2 Production keygen (TSS)
+The DKG ceremony flow:
+1. Each party starts a temporary P2P server
+2. Parties wait for all 3 to be online (health checks)
+3. `distributedKeygen()` runs the 5-round DKLs23 protocol via P2P
+4. Each party saves their keyshare to `data/keyshare-{partyId}.bin`
+5. All parties print the same group ETH address
+6. Exit
 
-All 3 parties coordinate on:
-- session_id: unique integer
-- start_time: exact UTC timestamp
-- threshold: 2
+### 3.2 Production keygen (GG19)
 
-At start_time:
-1. Each party verifies all others are connected
-2. tss-lib keygen protocol runs (9 rounds, ~10 seconds)
-3. Messages routed via P2P layer
-4. Each party receives LocalPartySaveData (their key share)
-5. Key shares stored in Vault
+Bridgeless uses GG19 (9 rounds) with pre-parameters:
+- Two safe primes (p, q where p = 2p'+1, q = 2q'+1)
+- A Paillier keypair derived from these primes
+- Takes 30-60 seconds per party
 
 Bridgeless ref: `tss-svc/internal/tss/keygener.go`
-
-```go
-params := tss.NewParameters(
-    tss.S256(),                              // secp256k1 curve
-    tss.NewPeerContext(sortedPartyIds),       // All party IDs
-    myPartyId,                               // This party's ID
-    3,                                        // Total parties
-    2,                                        // Threshold
-)
-
-party := keygen.NewLocalParty(params, outChan, endChan, preParams)
-party.Start()
-
-result := <-endChan  // LocalPartySaveData
-```
 
 ### 3.3 Output
 
@@ -311,12 +296,16 @@ Any incoming connection without a valid client cert gets rejected. The cert's pu
 
 | Type | Direction | Purpose |
 |------|-----------|---------|
-| `proposal` | Leader -> All | Propose deposit for signing |
-| `proposal_response` | Acceptor -> Leader | ACK or NACK |
-| `signer_set` | Leader -> All | Which parties will sign |
-| `evm_signature` | Signer -> All | EVM withdrawal signature |
-| `zano_sign_request` | Leader -> Signers | Unsigned Zano tx data |
-| `zano_signature` | Signer -> Leader | Zano tx signature |
+| `proposal` | Leader → All | Propose deposit for signing |
+| `proposal_response` | Acceptor → Leader | ACK or NACK |
+| `signer_set` | Leader → All | Which parties will sign |
+| `tss_sign_msg1` | Signer ↔ Signer | TSS signing round 1 (broadcast) |
+| `tss_sign_msg2` | Signer ↔ Signer | TSS signing round 2 (P2P) |
+| `tss_sign_msg3` | Signer ↔ Signer | TSS signing round 3 (P2P) |
+| `tss_sign_last` | Signer ↔ Signer | TSS signing last message (broadcast) |
+| `tss_zano_tx_data` | Leader → Co-signer | Unsigned Zano tx for TSS signing |
+| `tss_dkg_msg{1-4}` | All ↔ All | DKG ceremony rounds |
+| `tss_dkg_commitment` | All ↔ All | DKG chain code commitments |
 
 ### 4.4 Reliable broadcast (Dolev-Strong)
 
@@ -365,15 +354,6 @@ Algo 4, L10: Select signers          →   selectSigners(acceptors) + self
 Algo 4, L12: Broadcast SIGNSTART     →   broadcast({type: 'signer_set', ...})
 ```
 
-Signer selection follows the Go pattern: select THRESHOLD signers from acceptors, then always append the proposer. This ensures the proposer is never excluded from signing.
-
-```javascript
-// Go ref: proposer.go getSignersSet()
-const acceptorIds = acks.map(a => a.sender);
-const selectedAcceptors = selectSigners(acceptorIds, config.threshold, sessionId);
-const selectedSigners = [...selectedAcceptors, config.partyId];
-```
-
 ### 5.3 Acceptor flow (Paper Algorithm 5)
 
 This is the security-critical path. The acceptor never trusts the proposer's data.
@@ -391,38 +371,9 @@ Algo 5, L16: Wait for SIGNSTART      →   onMessage('signer_set', handler)
 Algo 5, L16: Verify deposit matches  →   Check tx_hash against verifiedDeposit
 ```
 
-Key security measures in the acceptor:
-
-**Single-proposal guard** (Algorithm 5, Line 4): Prevents a Byzantine proposer from sending multiple proposals in the same session.
-
-**Independent chain verification** (Algorithm 5, Lines 5-11): The acceptor fetches deposit data directly from the chain via `getEvmDepositData()` or `getZanoDepositData()`. It never uses the proposer's claimed amount, receiver, or token address for signing.
-
-**Duplicate signing guard**: Before ACKing, the acceptor checks if the deposit has already been processed:
-```javascript
-const existingDeposit = getDepositByTxHash(sourceChain, txHash, txNonce ?? 0);
-if (existingDeposit && existingDeposit.status !== 'pending') {
-  // NACK: already processed
-}
-```
-
-**Verified data override**: When returning deposit data for signing, the acceptor maps its independently verified camelCase data to the snake_case DB format:
-```javascript
-deposit = {
-  ...msg.data.deposit,                       // DB id, status from proposer
-  source_chain: verifiedDeposit.sourceChain,  // Override with verified data
-  tx_hash: verifiedDeposit.txHash,
-  token_address: verifiedDeposit.tokenAddress,
-  amount: verifiedDeposit.amount,
-  receiver: verifiedDeposit.receiver,
-  // ...
-};
-```
-
-Without this mapping, the proposer's unverified data could leak through because of the camelCase/snake_case naming difference.
-
 ### 5.4 Signer selection
 
-From the parties that ACKed, the leader picks signers deterministically:
+From the parties that ACKed, the leader picks 2 signers deterministically:
 
 ```javascript
 export function selectSigners(candidates, threshold, sessionId) {
@@ -440,7 +391,7 @@ export function selectSigners(candidates, threshold, sessionId) {
 }
 ```
 
-Everyone computes the same set independently.
+Everyone computes the same set independently. The 2 selected signers then run the TSS protocol.
 
 ---
 
@@ -471,13 +422,15 @@ contract DeuroToken is ERC20, ERC20Burnable, AccessControl {
 
 ```solidity
 contract DeuroBridge is Ownable, ReentrancyGuard, Pausable {
-    uint256 public signaturesThreshold;
-    address[] public signers;
+    uint256 public signaturesThreshold;  // 1 for TSS
+    address[] public signers;            // [groupAddress]
     mapping(address => bool) public isSigner;
     mapping(bytes32 => bool) public usedHashes;
     // ...
 }
 ```
+
+TSS deployment: the contract is deployed with `signers=[groupAddress]` and `threshold=1`. The 2-of-3 threshold is enforced off-chain by the DKLs23 protocol.
 
 Security features:
 - `ReentrancyGuard` on all withdrawal functions
@@ -486,9 +439,7 @@ Security features:
 - Bitmap-based signer deduplication in `_checkSignatures`
 - Replay protection via `usedHashes` mapping
 
-Bridgeless ref: `bridge-contracts/contracts/bridge/Bridge.sol`, `utils/Signers.sol`, `utils/Hashes.sol`
-
-### 6.2 Deposit flow (EVM -> Zano)
+### 6.2 Deposit flow (EVM → Zano)
 
 ```solidity
 function depositERC20(
@@ -506,14 +457,7 @@ function depositERC20(
 }
 ```
 
-From the user's perspective:
-```bash
-# 1. Approve bridge to spend dEURO
-# 2. Call depositERC20
-DEPOSITOR_KEY=0x... node src/deposit-evm.js <zano-address> <amount>
-```
-
-### 6.3 Withdrawal flow (Zano -> EVM)
+### 6.3 Withdrawal flow (Zano → EVM)
 
 ```solidity
 function withdrawERC20(
@@ -523,11 +467,11 @@ function withdrawERC20(
     bytes32 txHash_,      // Zano burn tx hash
     uint256 txNonce_,
     bool isWrapped_,
-    bytes[] calldata signatures_
+    bytes[] calldata signatures_   // 1 TSS signature
 ) external whenNotPaused nonReentrant {
     bytes32 signHash_ = getERC20SignHash(token_, amount_, receiver_, txHash_, txNonce_, block.chainid, isWrapped_);
     _checkAndUpdateHashes(txHash_, txNonce_);  // Replay protection
-    _checkSignatures(signHash_, signatures_);   // Verify TSS signatures
+    _checkSignatures(signHash_, signatures_);   // Verify TSS signature
     _withdrawERC20(token_, amount_, receiver_, isWrapped_);
 }
 ```
@@ -551,6 +495,8 @@ function _checkSignatures(bytes32 signHash_, bytes[] calldata signatures_) inter
 }
 ```
 
+With TSS, `signatures_` contains exactly 1 signature. The recovered address is the TSS group address.
+
 ### 6.5 Hash computation (off-chain must match on-chain)
 
 ```
@@ -570,34 +516,14 @@ export function computeErc20SignHash(token, amount, receiver, txHash, txNonce, c
 }
 ```
 
-### 6.6 Token mapping
-
-For Zano -> EVM deposits, `deposit.token_address` is the Zano asset ID. The bridge maps it to the EVM token address:
-
+The EIP-191 prefix is applied before TSS signing:
 ```javascript
-// config.js
-tokenMapping: { [ZANO_ASSET_ID]: DEURO_TOKEN }
-
-// evm-signer.js
-export function resolveEvmTokenAddress(tokenAddress) {
-  return config.tokenMapping[tokenAddress] || tokenAddress;
-}
+const eip191Hash = ethers.hashMessage(ethers.getBytes(signHash));
+const messageHash = ethers.getBytes(eip191Hash);
+// TSS signs messageHash
 ```
 
-### 6.7 Deposit detection
-
-Implementation: `src/evm-watcher.js`
-
-Each party watches DeuroBridge for `DepositedERC20` events:
-1. Poll for new events from last processed block
-2. Extract: token, amount, receiver (Zano address), isWrapped
-3. Wait for 64 block confirmations (Bridgeless production value)
-4. Store in SQLite as `pending`
-5. Available for next signing session
-
-Bridgeless ref: `tss-svc/internal/bridge/chain/evm/deposit.go`
-
-### 6.8 Replay protection
+### 6.6 Replay protection
 
 ```solidity
 mapping(bytes32 => bool) public usedHashes;
@@ -621,12 +547,10 @@ Zano has external ECDSA signing for asset operations. You register an asset with
 
 The flow:
 1. Register asset with TSS group's public key as `new_owner_eth_pub_key`
-2. To mint: wallet creates unsigned tx, TSS signs it, `send_ext_signed_asset_tx` broadcasts
+2. To mint: wallet creates unsigned tx → 2-of-3 TSS signing → `send_ext_signed_asset_tx` broadcasts
 3. To burn: user burns directly (no TSS needed)
 
-### 7.2 Minting (EVM -> Zano direction)
-
-Bridgeless ref: `tss-svc/pkg/zano/main.go` and `internal/bridge/chain/zano/withdraw.go`
+### 7.2 Minting (EVM → Zano direction)
 
 ```
 Step 1: Create unsigned emit transaction
@@ -642,49 +566,36 @@ Step 1: Create unsigned emit transaction
     }
   }
 
-Step 2: Form signing data
-  sig_data = hex_decode("0x" + tx_id)   // Raw bytes of tx ID
+Step 2: Leader shares tx data with co-signer
+  P2P message: tss_zano_tx_data { txId, unsignedTx, finalizedTx }
 
-Step 3: Sign sig_data
-  PoC: each party signs with own key directly (no Ethereum prefix)
-  Production: 2-of-3 TSS signing
+Step 3: Both signers form signing data
+  sig_data = hex_decode("0x" + tx_id)   // Raw 32-byte hash of tx ID
 
-Step 4: Encode signature for Zano
-  raw = Signature + SignatureRecovery
-  encoded = hex(raw)[2:-2]   // Strip "0x" prefix and last 2 chars
+Step 4: TSS signing
+  Both signers run DKLs23 protocol on sig_data
+  Output: (R, S) — identical for both parties
 
-Step 5: Broadcast
+Step 5: Leader encodes and broadcasts
+  zanoSig = rHex + sHex (128 chars, no V, no 0x prefix)
   wallet RPC: send_ext_signed_asset_tx
   params: {
-    eth_sig: encoded,
+    eth_sig: zanoSig,
     expected_tx_id: tx_id,
     finalized_tx: finalized_tx,
-    unsigned_tx: unsigned_tx,
-    unlock_transfers_on_fail: false
+    unsigned_tx: unsigned_tx
   }
 ```
 
-Signature encoding (from `zano-rpc.js`, matches Go `tss-svc/pkg/zano/utils.go`):
+Zano expects raw R+S without a recovery byte:
 ```javascript
-export function encodeSignatureForZano(signature) {
-  const raw = signature.startsWith('0x') ? signature.slice(2) : signature;
-  return raw.slice(0, raw.length - 2);  // Strip recovery byte
+// tss.js
+export function formatZanoSignature(r, s) {
+  return Buffer.from(r).toString('hex') + Buffer.from(s).toString('hex');
 }
 ```
 
-### 7.3 Zano signing in the PoC
-
-Zano expects the raw tx_id to be signed directly with ECDSA -- no keccak256 or Ethereum prefix.
-
-```javascript
-// zano-signer.js
-const signingKey = new ethers.SigningKey(myKey.privateKey);
-const sig = signingKey.sign(normalizedSigData);  // Sign raw 32-byte tx_id
-```
-
-Reference: `zano/utils/JS/test_eth_sig.js`
-
-### 7.4 Deposit detection (Zano -> EVM)
+### 7.3 Deposit detection (Zano → EVM)
 
 Implementation: `src/zano-watcher.js`
 
@@ -710,15 +621,12 @@ Implementation: `src/zano-watcher.js`
 6. Store as pending deposit
 ```
 
-Bridgeless ref: `tss-svc/internal/bridge/chain/zano/deposit.go`
-
-### 7.5 Independent chain verification (Paper Algorithm 13)
+### 7.4 Independent chain verification (Paper Algorithm 13)
 
 During consensus, each acceptor independently fetches Zano deposit data:
 
 ```javascript
 // zano-watcher.js getZanoDepositData()
-// Paper Algorithm 13: getDepositData()
 export async function getZanoDepositData(txHash) {
   const txResult = await searchForTransactions(txHash);
   const tx = allTxs.find(t => t.tx_hash === txHash);
@@ -735,7 +643,7 @@ export async function getZanoDepositData(txHash) {
 }
 ```
 
-### 7.6 Zano RPC methods used
+### 7.5 Zano RPC methods used
 
 | Method | Type | Purpose |
 |--------|------|---------|
@@ -747,7 +655,7 @@ export async function getZanoDepositData(txHash) {
 | `get_wallet_info` | wallet | Get bridge wallet address |
 | `getheight` | daemon | Get current block height |
 
-### 7.7 Zano address format
+### 7.6 Zano address format
 
 CryptoNote-style, base58:
 ```
@@ -759,118 +667,85 @@ Base58 encoding, 97 characters
 
 ## 8. Signing protocol
 
-### 8.1 EVM signing flow (Zano -> EVM)
+### 8.1 TSS signing flow overview
+
+Both directions (EVM and Zano) use the same DKLs23 signing protocol. The difference is only in what gets signed (EVM hash vs Zano tx_id) and how the signature is formatted afterward.
+
+```
+1. Leader selects 2-of-3 signers via consensus
+2. Both signers compute the hash to sign (deterministic)
+3. Both signers run DKLs23 protocol:
+   a. createFirstMessage() → broadcast to co-signer
+   b. 3 rounds of handleMessages() with P2P message exchange
+   c. lastMessage(hash) → broadcast
+   d. combine() → (R, S)
+4. Both signers arrive at identical (R, S)
+5. Leader formats and submits the signature
+```
+
+### 8.2 EVM signing (Zano → EVM)
 
 Implementation: `party.js handleEvmSigning()`
 
-Paper reference: Algorithm 6 (signing), Algorithm 7 (finalization)
-
 ```
-1. Status guard (Algo 7, L2):
-   Reject if deposit.status is not 'processing' or 'pending'
+1. Both signers compute the withdrawal hash:
+   signHash = computeErc20SignHash(token, amount, receiver, txHash, txNonce, chainId, isWrapped)
+   eip191Hash = ethers.hashMessage(ethers.getBytes(signHash))
+   messageHash = ethers.getBytes(eip191Hash)
 
-2. Each signer:
-   a. Compute ERC20 sign hash (must match on-chain)
-   b. Sign with own ECDSA key
-   c. Broadcast signature to other parties
+2. Both signers run DKLs23 protocol on messageHash → (R, S)
 
-3. Leader collects signatures:
-   a. Verify each signature (Algo 6, L9-10)
-   b. Reject relayed copies of own signature
-   c. Deduplicate by signer address
-   d. Verify signer is a registered party
-   e. Collect threshold (2) signatures
+3. Leader formats signature:
+   V = trial recovery (try v=27, v=28 against group address)
+   signature = "0x" + rHex + sHex + vHex  (65 bytes, v=0x1b or 0x1c)
 
-4. Leader auto-submits withdrawERC20() on-chain (Algo 7)
-
-5. On error: revert deposit to PENDING (Algo 3, L27-30)
-   This preserves bridge liveness (Theorem 1)
+4. Leader submits withdrawERC20(token, amount, receiver, txHash, txNonce, isWrapped, [signature])
 ```
 
-### 8.2 Zano signing flow (EVM -> Zano)
+The EIP-191 prefix is applied before TSS signing because Bridge.sol verifies: `signHash_.toEthSignedMessageHash().recover(sig)`.
+
+### 8.3 Zano signing (EVM → Zano)
 
 Implementation: `party.js handleZanoSigning()`
 
 ```
-1. Status guard (Algo 7, L2)
-
-2. Leader:
-   a. Create unsigned emit tx via Zano RPC
-   b. Sign tx_id with own key
-   c. Broadcast unsigned tx data + signature to signers
-   d. Wait for other signer's signature
-   e. Broadcast signed tx via send_ext_signed_asset_tx
-
-3. Non-leader:
-   a. Wait for leader's signing request
-   b. Sign tx_id
-   c. Send signature back to leader
-
-4. On error: revert to PENDING
+1. Leader creates unsigned emit tx via Zano RPC
+2. Leader sends tx data to co-signer via P2P (tss_zano_tx_data)
+3. Both signers compute sigData = formSigningData(txId)  (raw 32-byte hash)
+4. Both signers run DKLs23 protocol on sigData → (R, S)
+5. Leader encodes: zanoSig = rHex + sHex (128 chars, no V, no 0x prefix)
+6. Leader broadcasts via send_ext_signed_asset_tx
 ```
 
-### 8.3 Signature verification in waitForSignatures
+No EIP-191 prefix for Zano -- Zano expects the raw tx_id to be signed directly.
+
+### 8.4 P2P transport for TSS rounds
+
+During signing, the 2 selected signers exchange messages through the existing P2P layer. A `createTssTransport(sessionId, signers)` function in `party.js` creates `sendMsg`/`waitForMsgs` callbacks that:
+
+- Route TSS messages through the P2P layer with proper session isolation
+- Pre-register handlers for all 4 TSS message types
+- Include timeout handling (30 seconds per signing session)
+
+### 8.5 Signature output format
+
+For EVM: 65-byte hex string `0x` + R(32) + S(32) + V(1), where V = 0x1b (27) or 0x1c (28)
+For Zano: 128-char hex string R(32) + S(32), no V, no 0x prefix
+
+### 8.6 Recovery parameter (V)
+
+DKLs23 only outputs (R, S). The recovery parameter V is computed by trial:
 
 ```javascript
-function waitForSignatures(sessionId, type, count, signHash = null) {
-  const collected = [];
-  const seenSigners = new Set();
-  const myAddress = config.partyKeys?.[config.partyId]?.address?.toLowerCase();
-
-  const handler = (msg) => {
-    if (msg.sessionId !== sessionId) return;
-
-    if (signHash && msg.data?.signature && msg.data?.signer) {
-      const signerAddr = msg.data.signer.toLowerCase();
-
-      // Reject relayed copy of own signature
-      if (signerAddr === myAddress) return;
-
-      // Deduplicate by signer address
-      if (seenSigners.has(signerAddr)) return;
-
-      // Verify signature cryptographically (Algo 6, L9-10)
-      const valid = verifySignature(signHash, msg.data.signature, msg.data.signer);
-      if (!valid) return;
-
-      // Verify signer is a registered party
-      const isParty = config.partyKeys?.some(
-        k => k.address.toLowerCase() === signerAddr
-      );
-      if (!isParty) return;
-
-      seenSigners.add(signerAddr);
+export function computeRecoveryParam(r, s, messageHash, expectedAddress) {
+  for (const v of [27, 28]) {
+    const sig = ethers.Signature.from({ r: rHex, s: sHex, v });
+    const recovered = ethers.recoverAddress(hashHex, sig);
+    if (recovered.toLowerCase() === expectedAddress.toLowerCase()) {
+      return v;
     }
-
-    collected.push(msg);
-  };
-}
-```
-
-### 8.4 Signature output format
-
-For EVM: standard 65-byte Ethereum signature (r + s + v, where v = recovery + 27)
-For Zano: hex-encoded signature with recovery byte stripped
-
-### 8.5 Production signing (TSS)
-
-tss-lib gives you:
-```
-SignatureData {
-    Signature:         []byte  // 64 bytes (R || S)
-    SignatureRecovery: []byte  // 1 byte (V)
-    R:                 []byte  // 32 bytes
-    S:                 []byte  // 32 bytes
-    M:                 []byte  // Original message
-}
-```
-
-EVM conversion (from Go):
-```go
-func convertToEthSignature(sig *common.SignatureData) string {
-    rawSig := append(sig.Signature, sig.SignatureRecovery...)
-    rawSig[64] += 27  // Ethereum recovery ID offset
-    return hexutil.Encode(rawSig)
+  }
+  throw new Error('Could not recover V');
 }
 ```
 
@@ -895,7 +770,7 @@ The bridge was built by referencing the Bridgeless security paper (arXiv 2506.19
 |-----------|-------|-----|--------|
 | Algo 4 (Proposer) | Propose signHash, wait ACKs, select signers | Send raw fields, same logic | Compliant (security-equivalent) |
 | Algo 5 (Acceptor) | Independent verification, single-proposal guard | getEvmDepositData / getZanoDepositData | Compliant |
-| Algo 6 (Signing) | Verify signatures before accepting | verifySignature + dedup + relay rejection | Compliant |
+| Algo 6 (Signing) | 2-of-3 cooperative signing | DKLs23 TSS (2 signers cooperate) | Compliant |
 | Algo 7 (Finalization) | Status guard, submit on-chain | Status check + auto-submit | Compliant |
 | Algo 8/10 (EVM chain client) | getDepositData, computeSignHash | evm-watcher.js, evm-signer.js | Compliant |
 | Algo 12/13 (Zano chain client) | getDepositData, serviceEntries | zano-watcher.js getZanoDepositData | Compliant |
@@ -908,9 +783,10 @@ Assumptions:
 - Each party runs on independently operated infrastructure
 
 What this gives you:
-- A single compromised party can't produce valid signatures
+- A single compromised party can't produce valid signatures (TSS requires 2 shares)
 - 2 honest parties can always sign (1 can be offline)
 - The full private key never exists anywhere -- not even during signing
+- Both EVM and Zano sides are equally protected (unlike multi-sig where Zano was 1-of-1)
 
 ### 9.4 Security measures
 
@@ -918,8 +794,6 @@ What this gives you:
 |--------|-----------|----------|
 | Replay attack | `usedHashes` mapping: `keccak256(txHash, txNonce)` | DeuroBridge.sol |
 | Duplicate signer on-chain | Bitmap check in `_checkSignatures` | DeuroBridge.sol |
-| Duplicate signer off-chain | `seenSigners` Set in waitForSignatures | party.js |
-| Relayed own signature | Self-address check before accepting | party.js |
 | Threshold bypass | `signatures.length >= threshold` check | DeuroBridge.sol |
 | Chain ID confusion | `chainId` included in sign hash | evm-signer.js |
 | Reentrancy | `nonReentrant` modifier (OZ ReentrancyGuard) | DeuroBridge.sol |
@@ -930,8 +804,7 @@ What this gives you:
 | Failed signing stalls bridge | Revert to PENDING on error | party.js |
 | Token address mismatch | Token mapping with config validation | evm-signer.js |
 | Invalid EVM address in memo | Regex validation `/^0x[0-9a-fA-F]{40}$/` | zano-watcher.js |
-| Invalid signature in collection | Cryptographic verify before accept (Algo 6, L9-10) | party.js |
-| Unknown signer | Check against registered party keys | party.js |
+| Single-party Zano signing | TSS requires 2-of-3 cooperation | tss.js |
 | Amount validation | `> 0` checks on-chain | DeuroBridge.sol |
 | EIP-191 sig format | `toEthSignedMessageHash` in contract | DeuroBridge.sol |
 
@@ -955,6 +828,7 @@ Match Bridgeless production values:
 | Man-in-the-middle | Intercept P2P messages | mTLS with pre-exchanged certificates (production) |
 | Proposer manipulation | Leader proposes fraudulent withdrawal | Acceptors verify independently. Need 2 ACKs |
 | DoS | One party refuses to sign | Leader rotates each session. 2-of-3 only needs 2 |
+| Rogue Zano signer | Single party mints tokens | TSS: no single party can sign (was 1-of-1 with multi-sig) |
 
 ### 9.7 Acceptable PoC simplifications
 
@@ -966,9 +840,9 @@ These are documented deviations that don't affect security properties:
 | Proposal content | signHash | Raw deposit fields | Security-equivalent: same fields → same hash |
 | Leader PRNG | ChaCha8 seeded with SHA256 | First 4 bytes of SHA256 | Both deterministic, same result per sid |
 | Error status | FAILED (Go) | PENDING (Paper Algo 3, L27-30) | PoC follows paper; preserves Theorem 1 liveness |
-| Session timing | 5s/15s/13s/5s/7s | 10s consensus / 15s signing | Acceptable for PoC |
+| Session timing | 5s/15s/13s/5s/7s | 10s consensus / 30s signing | Acceptable for PoC |
 | Finalization | Separate relayer-svc | Leader auto-submits | Paper Algo 7 doesn't specify who submits |
-| Sig distribution | Go distribution.go (broadcast combined sig) | Each party broadcasts own sig | TSS-specific; not needed in multi-sig PoC |
+| TSS library | GG19 (bnb-chain/tss-lib) | DKLs23 (silence-labs WASM) | Both produce standard ECDSA; DKLs23 fewer rounds |
 
 ### 9.8 Operational security (production)
 
@@ -998,28 +872,36 @@ These are documented deviations that don't affect security properties:
 cd poc
 npm install
 
-# Generate 3 party ECDSA keys
-node src/keygen.js
-# Output: data/party-keys.json (3 keypairs)
+# Generate TSS keyshares (run all 3 simultaneously)
+PARTY_ID=0 node src/keygen.js
+PARTY_ID=1 node src/keygen.js
+PARTY_ID=2 node src/keygen.js
+# Output: data/keyshare-0.bin, keyshare-1.bin, keyshare-2.bin
+# All 3 print the same group ETH address
 ```
 
 ### 10.3 Deploy contracts
 
 ```bash
 # Deploy DeuroBridge to Sepolia
-# Registers all 3 party addresses as signers, threshold = 2
+# Reads group address from data/keyshare-0.bin, deploys with threshold=1
 npx hardhat run scripts/deploy.js --network sepolia
 # Output: bridge address (save as BRIDGE_ADDRESS)
 
 # Deploy DeuroToken + grant MINTER_ROLE to bridge
 BRIDGE_ADDRESS=0x... npx hardhat run scripts/deploy-token.js --network sepolia
 # Output: token address (save as DEURO_TOKEN)
-# Also mints initial supply to deployer for testing
 ```
 
 ### 10.4 Zano asset setup
 
-Register the dEURO asset on Zano testnet with Party A's Ethereum public key as the asset owner. This allows the bridge to mint dEURO on Zano via `send_ext_signed_asset_tx`.
+Register the dEURO asset on Zano testnet with the TSS group's Ethereum public key as the asset owner. This allows the bridge to mint dEURO on Zano via `send_ext_signed_asset_tx`.
+
+The group public key can be derived from any keyshare:
+```javascript
+const keyshareBytes = readFileSync('data/keyshare-0.bin');
+const groupAddress = getGroupAddress(keyshareBytes);
+```
 
 ### 10.5 Configuration
 
@@ -1034,6 +916,7 @@ Environment variables:
 | `ZANO_ASSET_ID` | Zano dEURO asset ID | `ff3666...` |
 | `ZANO_DAEMON_RPC` | Zano daemon RPC | `http://127.0.0.1:11211/json_rpc` |
 | `ZANO_WALLET_RPC` | Zano wallet RPC | `http://127.0.0.1:11212/json_rpc` |
+| `SUBMITTER_PRIVATE_KEY` | EVM key for gas (submitting txs) | `0x...` |
 
 ### 10.6 Running parties
 
@@ -1052,34 +935,26 @@ Each party runs on a separate port (4000, 4001, 4002).
 
 ### 10.7 Making deposits
 
-**EVM -> Zano** (lock dEURO on Sepolia, mint on Zano):
+**EVM → Zano** (lock dEURO on Sepolia, mint on Zano):
 ```bash
 DEPOSITOR_KEY=0x... node src/deposit-evm.js <zano-address> <amount>
 ```
 - Approves bridge to spend dEURO
 - Calls `depositERC20(token, amount, zanoAddr, isWrapped=false)`
-- Parties detect the event, run consensus, sign, mint on Zano
+- Parties detect the event, run consensus, TSS sign, mint on Zano
 
-**Zano -> EVM** (burn dEURO on Zano, mint on Sepolia):
+**Zano → EVM** (burn dEURO on Zano, mint on Sepolia):
 ```bash
 node src/deposit-zano.js <evm-address> <amount>
 ```
 - Burns dEURO on Zano with service_entries memo
-- Parties detect the burn, run consensus, sign, submit withdrawal on Sepolia
-
-### 10.8 Manual withdrawal (fallback)
-
-If auto-submission fails, use the manual script:
-```bash
-node scripts/withdraw-evm.js <deposit-id>
-```
-Reads signatures from the party database and calls `withdrawERC20()`.
+- Parties detect the burn, run consensus, TSS sign, submit withdrawal on Sepolia
 
 ---
 
 ## 11. Test suite
 
-114 tests across 7 test files. All tests use Vitest.
+102 tests across 7 test files. All tests use Vitest.
 
 ```bash
 # Run all tests
@@ -1087,23 +962,24 @@ npm test
 
 # By category
 npm run test:unit        # DB, consensus, EVM signer, Zano utils
-npm run test:contract    # DeuroBridge.sol (39 tests, Hardhat network)
+npm run test:contract    # DeuroBridge.sol (34 tests, Hardhat network)
 npm run test:integration # EVM→Zano and Zano→EVM flows
 ```
 
-### 11.1 Contract tests (39 tests)
+### 11.1 Contract tests (34 tests)
 
 `test/contract/bridge.test.js` -- DeuroBridge.sol on Hardhat network:
-- Deployment and initialization
+- Deployment with TSS group address and threshold=1
 - ERC20 deposits (lock and burn modes)
 - Native ETH deposits
-- ERC20 and native withdrawals with signature verification
+- ERC20 and native withdrawals with real TSS signatures
+- Any 2-of-3 signer combination works
 - Replay protection (usedHashes)
 - Signature threshold enforcement
 - Invalid/duplicate signer rejection
 - Admin functions (addSigner, removeSigner, setThreshold, pause)
 
-### 11.2 Unit tests (62 tests)
+### 11.2 Unit tests (55 tests)
 
 `test/unit/db.test.js` (21 tests):
 - Deposit CRUD operations
@@ -1117,11 +993,10 @@ npm run test:integration # EVM→Zano and Zano→EVM flows
 - Signer selection
 - Proposer/acceptor flows with mocked P2P
 
-`test/unit/evm-signer.test.js` (16 tests):
+`test/unit/evm-signer.test.js` (9 tests):
 - Hash computation matches on-chain
-- Signature generation and verification
 - Token address resolution
-- Contract format
+- ERC20 vs native hash differentiation
 
 `test/unit/zano-utils.test.js` (9 tests):
 - Signature encoding for Zano
@@ -1131,20 +1006,29 @@ npm run test:integration # EVM→Zano and Zano→EVM flows
 ### 11.3 Integration tests (13 tests)
 
 `test/integration/evm-to-zano.test.js` (7 tests):
-- Full EVM -> Zano flow with mock Zano
-- Deposit detection -> consensus -> signing -> broadcast
+- Full EVM → Zano flow with real TSS signing
+- Consensus failure when acceptor missing deposit
+- Consensus failure when no ACKs
+- P2P message routing
 
 `test/integration/zano-to-evm.test.js` (6 tests):
-- Full Zano -> EVM flow
-- Burn detection -> consensus -> signing -> withdrawal submission
+- Full Zano → EVM flow with real TSS signing
+- Native ETH withdrawal with TSS
+- Any 2-of-3 combination can sign
+- Signature recovery verification
 
 ### 11.4 Test infrastructure
 
 `test/helpers/`:
-- Mock P2P layer (in-process message routing)
-- Mock Zano RPC server
-- Test database factory (fresh SQLite per test)
-- Test party key fixtures
+- `tss-test-keyshares.js` -- generates real DKLs23 keyshares in-process (cached)
+- `in-process-p2p.js` -- in-process message routing (no HTTP)
+- `mock-zano-rpc.js` -- configurable fake Zano RPC
+- `test-db.js` -- fresh in-memory SQLite per test
+
+`test/fixtures.js`:
+- Hardhat account keys and addresses
+- Mock transaction hashes
+- Test chain ID and token addresses
 
 ---
 
@@ -1174,13 +1058,9 @@ npm run test:integration # EVM→Zano and Zano→EVM flows
 | `tss-svc/pkg/zano/main.go` | Zano SDK (emit, burn, transfer) |
 | `tss-svc/pkg/zano/client.go` | Zano JSON-RPC client |
 | `tss-svc/pkg/zano/utils.go` | Signature encoding for Zano |
-| `tss-svc/pkg/zano/types/types.go` | Zano data structures |
 | `tss-svc/internal/bridge/chain/evm/operations/` | EVM hash computation |
 | `tss-svc/internal/bridge/chain/evm/deposit.go` | EVM deposit detection |
 | `tss-svc/internal/bridge/chain/zano/deposit.go` | Zano deposit detection |
-| `tss-svc/internal/bridge/withdrawal/evm.go` | EVM withdrawal data |
-| `tss-svc/internal/bridge/withdrawal/zano.go` | Zano withdrawal data |
-| `tss-svc/internal/secrets/vault/vault.go` | HashiCorp Vault storage |
 | `bridge-contracts/contracts/bridge/Bridge.sol` | Main bridge contract |
 | `bridge-contracts/contracts/utils/Signers.sol` | Signature verification |
 | `bridge-contracts/contracts/utils/Hashes.sol` | Replay protection |
@@ -1201,18 +1081,7 @@ npm run test:integration # EVM→Zano and Zano→EVM flows
 
 Bridgeless ref: `tss-svc/internal/tss/session/boundaries.go`
 
-### 12.3 Documentation
-
-`tss-svc/docs/`:
-- `01_overview.md` -- service overview and protocol
-- `02_protocol.md` -- detailed TSS protocol flow
-- `03_performing-deposit.md` -- user deposit flows
-- `04_configuration.md` -- configuration reference
-- `05_key-generation.md` -- step-by-step keygen tutorial
-- `06_running-service.md` -- deployment guide
-- `07_key-resharing.md` -- key resharing procedures
-
-### 12.4 Security paper
+### 12.3 Security paper
 
 [arXiv 2506.19730](https://arxiv.org/abs/2506.19730) -- "Formalization and security analysis of the Bridgeless protocol"
 

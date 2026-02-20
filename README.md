@@ -1,6 +1,6 @@
 # deuro TSS Bridge
 
-Decentralized bridge between EVM (Sepolia) and Zano using 2-of-3 threshold signatures. Three independent parties run a Node.js service — no central coordinator needed.
+Decentralized bridge between EVM (Sepolia) and Zano using DKLs23 threshold ECDSA (2-of-3). Three independent parties run a Node.js service that cooperatively signs transactions -- no party ever holds the full private key.
 
 Built by referencing the [Bridgeless security paper](https://arxiv.org/abs/2506.19730) and the production Go implementation.
 
@@ -24,9 +24,16 @@ EVM (Sepolia)                          Zano (Testnet)
 └─────────────────────┘
 ```
 
-**EVM → Zano**: User deposits dEURO into bridge contract → parties detect event → consensus → sign Zano mint tx → dEURO appears on Zano
+**EVM → Zano**: User deposits dEURO into bridge contract → parties detect event → consensus → 2-of-3 TSS signing → dEURO appears on Zano
 
-**Zano → EVM**: User burns dEURO with destination memo → parties detect burn → consensus → sign EVM withdrawal → dEURO minted on Sepolia
+**Zano → EVM**: User burns dEURO with destination memo → parties detect burn → consensus → 2-of-3 TSS signing → dEURO minted on Sepolia
+
+## Signing
+
+DKLs23 threshold ECDSA via `@silencelaboratories/dkls-wasm-ll-node` (Trail of Bits audited, April 2024):
+- **Keygen**: distributed DKG ceremony (5 rounds) → each party saves a keyshare, all share one group public key
+- **Signing**: 2-of-3 parties run a multi-round protocol → single standard secp256k1 ECDSA signature
+- The full private key never exists anywhere -- not during keygen, not during signing
 
 ## Repository structure
 
@@ -36,9 +43,9 @@ EVM (Sepolia)                          Zano (Testnet)
 
 poc/                   Working implementation
   contracts/           DeuroBridge.sol, DeuroToken.sol (Solidity)
-  src/                 Party service, consensus, watchers, signers, P2P
+  src/                 Party service, TSS, consensus, watchers, signers, P2P
   scripts/             Deploy, run parties, Zano testnet setup, E2E test
-  test/                114 tests (contract, unit, integration)
+  test/                102 tests (contract, unit, integration)
 ```
 
 ## Quick start
@@ -50,8 +57,10 @@ npm install
 # Run tests (no external deps needed)
 npm test
 
-# Generate party keys
-node src/keygen.js
+# Generate TSS keyshares (run all 3 simultaneously)
+PARTY_ID=0 node src/keygen.js
+PARTY_ID=1 node src/keygen.js
+PARTY_ID=2 node src/keygen.js
 
 # Start all 3 parties
 ./scripts/run-parties.sh start
@@ -62,21 +71,11 @@ See [`poc/README.md`](poc/README.md) for full setup, deployment, live testing, a
 ## Security
 
 Key properties (from the [Bridgeless paper](https://arxiv.org/abs/2506.19730)):
-- Independent chain verification — each party checks deposits on-chain before signing
+- Independent chain verification -- each party checks deposits on-chain before signing
 - Replay protection via on-chain `usedHashes`
 - 64-block confirmation for Ethereum, 10 blocks for Zano
 - At most 1 of 3 parties can be compromised; 2 honest parties can always sign
-
-## PoC vs Production
-
-| Aspect | PoC | Production |
-|--------|-----|-----------|
-| Signing | Individual ECDSA (multi-sig) | GG19 TSS (bnb-chain/tss-lib) |
-| On-chain threshold | 2 (needs 2 sigs) | 1 (TSS combined sig) |
-| P2P | HTTP + API key | gRPC + mutual TLS |
-| Key storage | JSON file | HashiCorp Vault |
-
-Consensus, watchers, chain clients, and security logic are identical. Upgrading to TSS only changes the signing layer.
+- No party ever holds the full key -- a single compromised party learns nothing about the private key
 
 ## License
 
