@@ -8,4 +8,5 @@ typechain-types/
 party-keys.json
 .env
 *.log
+zano-testnet/
 .claude/

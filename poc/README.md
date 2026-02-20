@@ -62,6 +62,42 @@ npm run test:contract    # DeuroBridge.sol (39 tests, Hardhat)
 npm run test:integration # EVM→Zano and Zano→EVM flows
 ```
 
+## Live Testing
+
+Run the full bridge against live testnets (Sepolia + Zano testnet).
+
+### 1. Set up environment
+
+```bash
+cp .env.example .env
+# Edit .env: add DEPOSITOR_KEY (funded Sepolia wallet with dEURO)
+```
+
+### 2. Start Zano testnet
+
+Downloads official binaries from build.zano.org, syncs, and opens a wallet.
+
+```bash
+./scripts/setup-zano-testnet.sh         # download + start (first run takes ~5 min)
+./scripts/setup-zano-testnet.sh status   # check daemon + wallet
+./scripts/setup-zano-testnet.sh stop     # stop everything
+```
+
+Linux x64 only. Data stored in `zano-testnet/` (gitignored).
+
+### 3. Run E2E test
+
+Starts 3 parties, deposits in both directions, waits for finalization.
+
+```bash
+./scripts/e2e-test.sh                   # full test (EVM→Zano + Zano→EVM)
+SKIP_ZANO=1 ./scripts/e2e-test.sh       # EVM→Zano only
+```
+
+Uses `EVM_CONFIRMATIONS=2 ZANO_CONFIRMATIONS=2` by default for speed (~2 min per direction instead of ~15 min).
+
+Requires `DEPOSITOR_KEY` in `.env` — a Sepolia private key with ETH (from any faucet) and dEURO tokens (ask the contract deployer to send you some).
+
 ## Making a deposit
 
 ```bash
@@ -100,6 +136,8 @@ scripts/
   demo-signing.js       Interactive signing demo (step-by-step 2-of-3)
   withdraw-evm.js       Manual EVM withdrawal submission (fallback)
   run-parties.sh        Start/stop/status for all 3 parties
+  setup-zano-testnet.sh Download + start Zano testnet (daemon + wallet)
+  e2e-test.sh           End-to-end bridge test (both directions)
 
 test/
   contract/bridge.test.js        39 contract tests (Hardhat + Vitest)

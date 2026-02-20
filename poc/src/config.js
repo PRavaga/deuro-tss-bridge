@@ -41,7 +41,7 @@ export const config = {
     chainId: 11155111,
     bridgeAddress: process.env.BRIDGE_ADDRESS ?? '',
     deuroToken: process.env.DEURO_TOKEN ?? '',
-    confirmations: 64, // Bridgeless production: 64 blocks for Ethereum (~13 min)
+    confirmations: parseInt(process.env.EVM_CONFIRMATIONS ?? '64'), // Bridgeless production: 64 blocks (~13 min)
     pollInterval: 15_000, // 15 seconds
   },
 
@@ -49,7 +49,7 @@ export const config = {
   zano: {
     daemonRpc: process.env.ZANO_DAEMON_RPC ?? 'http://127.0.0.1:11211/json_rpc',
     walletRpc: process.env.ZANO_WALLET_RPC ?? 'http://127.0.0.1:11212/json_rpc',
-    confirmations: 10,
+    confirmations: parseInt(process.env.ZANO_CONFIRMATIONS ?? '10'),
     assetId: process.env.ZANO_ASSET_ID ?? '',
     pollInterval: 30_000, // 30 seconds
   },
