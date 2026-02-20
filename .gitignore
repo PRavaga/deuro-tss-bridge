@@ -1,0 +1,11 @@
+node_modules/
+artifacts/
+cache/
+typechain-types/
+*.db
+*.db-shm
+*.db-wal
+party-keys.json
+.env
+*.log
+.claude/

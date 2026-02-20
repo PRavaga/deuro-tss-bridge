@@ -1,0 +1,30 @@
+{
+  "name": "deuro-tss-bridge-poc",
+  "version": "0.1.0",
+  "description": "PoC: 2-of-3 TSS bridge between EVM (Sepolia) and Zano testnet",
+  "type": "module",
+  "scripts": {
+    "keygen": "node src/keygen.js",
+    "party": "node src/party.js",
+    "deposit-evm": "node src/deposit-evm.js",
+    "deposit-zano": "node src/deposit-zano.js",
+    "deploy": "npx hardhat run scripts/deploy.js --network sepolia",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:contract": "vitest run test/contract",
+    "test:integration": "vitest run test/integration"
+  },
+  "dependencies": {
+    "@silencelaboratories/dkls-wasm-ll-node": "^1.2.0",
+    "ethers": "^6.13.0",
+    "express": "^4.21.0",
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "hardhat": "^2.22.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.0",
+    "@openzeppelin/contracts": "^4.9.0",
+    "@openzeppelin/contracts-upgradeable": "^4.9.0",
+    "vitest": "^3.0.0"
+  }
+}
