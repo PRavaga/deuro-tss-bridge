@@ -4,7 +4,7 @@
 
 A decentralized bridge between EVM chains (Sepolia testnet) and Zano using threshold signatures. Three independent parties each run a service on their own infrastructure. No central coordinator or blockchain needed.
 
-Formally verified against the [Bridgeless security paper](https://arxiv.org/abs/2506.19730) (arXiv 2506.19730) — every algorithm, every security theorem.
+Built by referencing the [Bridgeless security paper](https://arxiv.org/abs/2506.19730) (arXiv 2506.19730) — algorithms, security theorems, and the production Go implementation.
 
 ## How it works
 
@@ -81,7 +81,7 @@ A single Node.js service with these components:
 
 ## Security model
 
-Formally verified properties (arXiv 2506.19730):
+Security properties from the paper (arXiv 2506.19730):
 
 - **Theorem 1 (Liveness)**: Every honest deposit eventually produces a withdrawal
 - **Theorem 4 (Safety)**: Every withdrawal has a corresponding deposit
