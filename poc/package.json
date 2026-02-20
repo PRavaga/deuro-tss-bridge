@@ -21,8 +21,8 @@
     "better-sqlite3": "^11.0.0"
   },
   "devDependencies": {
-    "hardhat": "^2.22.0",
-    "@nomicfoundation/hardhat-ethers": "^3.0.0",
+    "hardhat": "^3.1.9",
+    "@nomicfoundation/hardhat-ethers": "^4.0.4",
     "@openzeppelin/contracts": "^4.9.0",
     "@openzeppelin/contracts-upgradeable": "^4.9.0",
     "vitest": "^3.0.0"
