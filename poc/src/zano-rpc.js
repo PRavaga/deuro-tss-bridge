@@ -147,6 +147,8 @@ export async function transferWithBurn(assetId, amount, evmAddress) {
   const memo = JSON.stringify({
     dst_add: evmAddress,
     dst_net_id: 'evm',
+    amt: String(amount),
+    asset_id: assetId,
   });
   const memoHex = Buffer.from(memo, 'utf8').toString('hex');
 

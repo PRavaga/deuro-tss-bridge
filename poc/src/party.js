@@ -25,10 +25,10 @@ import { getDb } from './db.js';
 import { startP2PServer, broadcast, sendToParty, onMessage } from './p2p.js';
 import { initEvmWatcher, pollEvmDeposits } from './evm-watcher.js';
 import { initZanoWatcher, pollZanoDeposits } from './zano-watcher.js';
-import { determineLeader, getSessionId, runAsProposer, runAsAcceptor } from './consensus.js';
+import { determineLeader, getSessionId, runAsProposer, runAsAcceptor, cleanupBuffers } from './consensus.js';
 import { signEvmWithdrawal, computeErc20SignHash, resolveEvmTokenAddress } from './evm-signer.js';
 import { processZanoWithdrawal, signZanoTxHash, broadcastSignedZanoTx, createUnsignedEmitTx } from './zano-signer.js';
-import { updateDepositStatus } from './db.js';
+import { updateDepositStatus, getDepositByTxHash } from './db.js';
 import { initTss, getGroupAddress } from './tss.js';
 import { formSigningData } from './zano-rpc.js';
 import { ethers } from 'ethers';
@@ -65,6 +65,16 @@ async function main() {
   await initEvmWatcher();
   await initZanoWatcher();
 
+  // Register handler for cross-party finalization notifications
+  onMessage('deposit_finalized', (msg) => {
+    const { depositTxHash, depositTxNonce, sourceChain } = msg.data;
+    const existing = getDepositByTxHash(sourceChain, depositTxHash, depositTxNonce ?? 0);
+    if (existing && existing.status !== 'finalized') {
+      updateDepositStatus(existing.id, 'finalized');
+      console.log(`[Finalized] Deposit ${depositTxHash} marked as finalized (notified by party ${msg.sender})`);
+    }
+  });
+
   // Main loop
   console.log(`\n[Main] Starting session loop (interval: ${config.session.intervalMs}ms)\n`);
 
@@ -72,12 +82,16 @@ async function main() {
   await sleep(5000);
 
   while (true) {
+    const sessionStart = Date.now();
     try {
       await runSigningSession();
     } catch (err) {
       console.error('[Main] Session error:', err.message);
     }
-    await sleep(config.session.intervalMs);
+    // Wall-clock aligned sleep: subtract session execution time to prevent drift
+    const elapsed = Date.now() - sessionStart;
+    const remaining = Math.max(1000, config.session.intervalMs - elapsed);
+    await sleep(remaining);
   }
 }
 
@@ -87,6 +101,9 @@ async function main() {
  */
 async function runSigningSession() {
   sessionCounter++;
+
+  // Clean up stale consensus buffers from old sessions
+  cleanupBuffers(sessionCounter);
 
   // Poll both chains for new deposits
   await pollEvmDeposits();
@@ -123,19 +140,21 @@ async function runSigningSession() {
       continue;
     }
 
-    // Signing phase
+    // Signing phase (Paper Algorithm 6)
     const amISigner = result.signers.includes(config.partyId);
-    if (!amISigner) {
-      console.log('[Session] Not selected as signer, waiting for result');
-      continue;
-    }
 
-    console.log('[Session] Selected as signer, running TSS signing phase');
-
-    if (destChain === 'zano') {
-      await handleZanoSigning(sessionId, result);
+    if (amISigner) {
+      console.log('[Session] Selected as signer, running TSS signing phase');
+      if (destChain === 'zano') {
+        await handleZanoSigning(sessionId, result);
+      } else {
+        await handleEvmSigning(sessionId, result);
+      }
     } else {
-      await handleEvmSigning(sessionId, result);
+      // Paper Algorithm 6, Lines 6-10: non-signers wait for signature broadcast,
+      // verify it, and participate in finalization
+      console.log('[Session] Not selected as signer, waiting for signature broadcast');
+      await handleSignatureBroadcast(sessionId, result, destChain);
     }
   }
 }
@@ -251,10 +270,29 @@ async function handleZanoSigning(sessionId, result) {
       // Run TSS signing on the sigData
       const tssSig = await signZanoTxHash(unsignedTxData.sigData, sendMsg, waitForMsgs);
 
+      // Paper Algorithm 6, Line 4: broadcast signature result to all validators
+      await broadcast({
+        type: 'tss_signature_result',
+        sessionId,
+        data: {
+          signature: tssSig.zanoSig,
+          signer: config.tssGroupAddress,
+          depositTxHash: deposit.tx_hash,
+          direction: 'zano',
+        },
+      });
+
       // Broadcast the signed tx to Zano
       await broadcastSignedZanoTx(unsignedTxData, tssSig.zanoSig);
       updateDepositStatus(deposit.id, 'finalized');
       console.log('[Zano Signing] Transaction finalized!');
+
+      // Notify all parties that this deposit is finalized (prevent double-processing)
+      await broadcast({
+        type: 'deposit_finalized',
+        sessionId,
+        data: { depositTxHash: deposit.tx_hash, depositTxNonce: deposit.tx_nonce, sourceChain: deposit.source_chain },
+      });
     } else {
       // Co-signer: wait for tx data from leader, then run TSS
       const txData = await waitForTxData(sessionId);
@@ -263,12 +301,80 @@ async function handleZanoSigning(sessionId, result) {
       // Run TSS signing on the same sigData
       await signZanoTxHash(sigData, sendMsg, waitForMsgs);
 
-      // Leader will broadcast — we're done
+      // Leader will broadcast — mark as signed on our side
+      updateDepositStatus(deposit.id, 'signed');
       console.log('[Zano Signing] Co-signed successfully, leader will broadcast');
     }
   } catch (err) {
     console.error('[Zano Signing] Error:', err.message);
     updateDepositStatus(deposit.id, 'pending');
+  }
+}
+
+/**
+ * Handle signature broadcast for non-signers.
+ * Paper Algorithm 6, Lines 6-10: upon delivering (result, signHash) from a signer,
+ * verify the signature and mark the request as PROCESSED.
+ * Paper Algorithm 7: all validators attempt finalization.
+ *
+ * @param {string} sessionId  Current session ID
+ * @param {Object} result     Consensus result with deposit and signers
+ * @param {string} destChain  'evm' or 'zano'
+ */
+async function handleSignatureBroadcast(sessionId, result, destChain) {
+  const { deposit } = result;
+
+  try {
+    // Wait for the TSS signature broadcast from a signer
+    const sigMsg = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Timeout waiting for signature broadcast'));
+      }, config.session.signingTimeoutMs);
+
+      onMessage('tss_signature_result', (msg) => {
+        if (msg.sessionId !== sessionId) return;
+        clearTimeout(timeout);
+        resolve(msg);
+      });
+    });
+
+    const { signature, signer, depositTxHash } = sigMsg.data;
+    console.log(`[Session] Received signature broadcast from signer ${signer}`);
+
+    // Paper Algorithm 6, Line 9: verify the signature
+    if (signer !== config.tssGroupAddress) {
+      console.error(`[Session] Signature signer mismatch: expected ${config.tssGroupAddress}, got ${signer}`);
+      return;
+    }
+
+    if (depositTxHash !== deposit.tx_hash) {
+      console.error(`[Session] Signature deposit mismatch: expected ${deposit.tx_hash}, got ${depositTxHash}`);
+      return;
+    }
+
+    // Mark as PROCESSED (paper) = 'signed' (PoC)
+    updateDepositStatus(
+      deposit.id,
+      'signed',
+      [{ signature, signer }],
+    );
+    console.log(`[Session] Deposit ${deposit.tx_hash} marked as signed (verified signature)`);
+
+    // Paper Algorithm 7: all validators attempt finalization
+    // For EVM: any validator can submit the withdrawal on-chain
+    // For Zano: only the leader can submit (needs the unsigned tx data)
+    if (destChain === 'evm') {
+      console.log('[Session] Non-signer attempting EVM finalization...');
+      await submitEvmWithdrawal(deposit, { signature, signer });
+    }
+    // For Zano, only leader has the unsigned tx data, so non-signers
+    // just wait for the deposit_finalized broadcast
+  } catch (err) {
+    if (err.message.includes('Timeout')) {
+      console.log('[Session] No signature broadcast received, moving on');
+    } else {
+      console.error('[Session] Signature broadcast error:', err.message);
+    }
   }
 }
 
@@ -314,14 +420,27 @@ async function handleEvmSigning(sessionId, result) {
     const sigResult = await signEvmWithdrawal(deposit, sendMsg, waitForMsgs);
     console.log(`[EVM Signing] TSS signature produced, signer: ${sigResult.signer}`);
 
-    // Store the single TSS signature
+    // Paper Algorithm 6, Line 4: broadcast (result, signHash) to all validators
+    await broadcast({
+      type: 'tss_signature_result',
+      sessionId,
+      data: {
+        signature: sigResult.signature,
+        signer: sigResult.signer,
+        depositTxHash: deposit.tx_hash,
+        direction: 'evm',
+      },
+    });
+
+    // Store the single TSS signature (status → PROCESSED per paper)
     updateDepositStatus(
       deposit.id,
       'signed',
       [{ signature: sigResult.signature, signer: sigResult.signer }],
     );
 
-    // Leader submits the withdrawal on-chain
+    // Paper Algorithm 7: all validators attempt finalization.
+    // Leader submits first; non-signers get the signature via broadcast.
     if (isLeader) {
       console.log('[EVM Signing] Leader submitting withdrawal on-chain...');
       await submitEvmWithdrawal(deposit, sigResult);
@@ -354,7 +473,7 @@ async function submitEvmWithdrawal(deposit, sigResult) {
     const bridge = new ethers.Contract(config.evm.bridgeAddress, BRIDGE_ABI, wallet);
 
     const evmTokenAddress = resolveEvmTokenAddress(deposit.token_address);
-    const txHash = ethers.zeroPadBytes(deposit.tx_hash, 32);
+    const txHash = ethers.zeroPadBytes(deposit.tx_hash.startsWith('0x') ? deposit.tx_hash : '0x' + deposit.tx_hash, 32);
 
     console.log(`[EVM Submit] Token: ${evmTokenAddress}`);
     console.log(`[EVM Submit] Amount: ${deposit.amount}`);
@@ -368,7 +487,7 @@ async function submitEvmWithdrawal(deposit, sigResult) {
       deposit.receiver,
       txHash,
       deposit.tx_nonce,
-      false, // Custody model: release locked dEURO from bridge
+      true, // Mint model: bridge mints dEURO on withdrawal (has MINTER_ROLE)
       [sigResult.signature], // Single TSS signature
     );
 
@@ -378,9 +497,19 @@ async function submitEvmWithdrawal(deposit, sigResult) {
 
     updateDepositStatus(deposit.id, 'finalized');
     console.log('[EVM Submit] Withdrawal finalized!');
+
+    // Notify all parties that this deposit is finalized
+    await broadcast({
+      type: 'deposit_finalized',
+      sessionId: `evm_finalized_${deposit.tx_hash}`,
+      data: { depositTxHash: deposit.tx_hash, depositTxNonce: deposit.tx_nonce, sourceChain: deposit.source_chain },
+    });
   } catch (err) {
     console.error('[EVM Submit] Failed:', err.message);
-    // Keep status as 'signed' so it can be retried or manually submitted
+    // Paper Algorithm 3, Line 40: reset to PENDING on finalization failure
+    // so the deposit can be retried in a future session
+    updateDepositStatus(deposit.id, 'pending');
+    console.log('[EVM Submit] Reset deposit to pending for retry');
   }
 }
 

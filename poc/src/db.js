@@ -36,14 +36,6 @@ export function getDb() {
       UNIQUE(source_chain, tx_hash, tx_nonce)
     );
 
-    CREATE TABLE IF NOT EXISTS sessions (
-      id INTEGER PRIMARY KEY,
-      session_id TEXT NOT NULL UNIQUE,
-      leader_id INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      deposit_id INTEGER REFERENCES deposits(id),
-      created_at INTEGER DEFAULT (unixepoch())
-    );
   `);
 
   return db;
@@ -62,9 +54,15 @@ export function addDeposit(deposit) {
 
 export function getPendingDeposits(destChain) {
   const db = getDb();
+  // Paper Algorithm 4, Line 2: pick oldest PENDING request.
+  // Also include 'signed' deposits that are stale (>60s old) — these represent
+  // deposits where finalization failed and were not reset (Paper Algo 3, Line 40).
   return db.prepare(`
     SELECT * FROM deposits
-    WHERE dest_chain = ? AND status = 'pending'
+    WHERE dest_chain = ? AND (
+      status = 'pending'
+      OR (status = 'signed' AND updated_at < unixepoch() - 60)
+    )
     ORDER BY id ASC
     LIMIT 1
   `).all(destChain);

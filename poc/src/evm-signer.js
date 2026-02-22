@@ -104,7 +104,7 @@ export function resolveEvmTokenAddress(tokenAddress) {
  * @param {Function} waitForMsgs P2P receive function for TSS rounds
  */
 export async function signEvmWithdrawal(deposit, sendMsg, waitForMsgs) {
-  const isWrapped = false; // Custody model: bridge releases locked dEURO
+  const isWrapped = true; // Mint model: bridge mints dEURO on withdrawal (has MINTER_ROLE)
 
   // Map Zano asset ID to EVM token address
   const evmTokenAddress = resolveEvmTokenAddress(deposit.token_address);
@@ -113,7 +113,7 @@ export async function signEvmWithdrawal(deposit, sendMsg, waitForMsgs) {
     evmTokenAddress,
     deposit.amount,
     deposit.receiver,
-    ethers.zeroPadBytes(deposit.tx_hash, 32), // Pad Zano tx hash to bytes32
+    ethers.zeroPadBytes(deposit.tx_hash.startsWith('0x') ? deposit.tx_hash : '0x' + deposit.tx_hash, 32),
     deposit.tx_nonce,
     config.evm.chainId,
     isWrapped,

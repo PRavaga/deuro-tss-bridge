@@ -15,7 +15,7 @@ import { config } from './config.js';
 const messageHandlers = new Map();  // sessionType -> handler function
 const pendingMessages = new Map();  // type -> [msg, ...] (buffered until handler registers)
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // TSS messages contain large WASM binary payloads
 
 // API key for basic auth (in production: mTLS with pre-exchanged certs)
 const API_KEY = process.env.P2P_API_KEY ?? 'deuro-poc-key-change-me';
@@ -26,7 +26,12 @@ const API_KEY = process.env.P2P_API_KEY ?? 'deuro-poc-key-change-me';
 export function startP2PServer() {
   const port = parseInt(process.env.P2P_BASE_PORT ?? '4000') + config.partyId;
 
-  // Authentication middleware
+  // Health check (no auth — used by checkPartyHealth for discovery)
+  app.get('/p2p/health', (_req, res) => {
+    res.json({ partyId: config.partyId, status: 'ok' });
+  });
+
+  // Authentication middleware (applied to all other /p2p routes)
   app.use('/p2p', (req, res, next) => {
     const key = req.headers['x-api-key'];
     if (key !== API_KEY) {
@@ -59,11 +64,6 @@ export function startP2PServer() {
       console.error(`[P2P] Handler error for ${type}:`, err.message);
       res.status(500).json({ error: err.message });
     }
-  });
-
-  // Health check
-  app.get('/p2p/health', (_req, res) => {
-    res.json({ partyId: config.partyId, status: 'ok' });
   });
 
   app.listen(port, () => {

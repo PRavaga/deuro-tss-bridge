@@ -25,11 +25,138 @@
 //   - acceptor.go: proposal verification
 
 import { createHash } from 'crypto';
+import { ethers } from 'ethers';
 import { config } from './config.js';
 import { getPendingDeposits, updateDepositStatus, getDepositByTxHash } from './db.js';
 import { broadcast, onMessage, waitForMessage } from './p2p.js';
 import { verifyEvmDeposit, getEvmDepositData } from './evm-watcher.js';
 import { verifyZanoBurn, getZanoDepositData } from './zano-watcher.js';
+import { computeErc20SignHash, resolveEvmTokenAddress } from './evm-signer.js';
+
+// Per-session message buffers.
+// Proposals and signer sets that arrive before the acceptor registers its handler
+// are stored here so they aren't lost when a subsequent session overwrites the handler.
+const proposalBuffer = new Map();   // sessionId -> msg
+const signerSetBuffer = new Map();  // sessionId -> msg
+
+// Track which sessions have already received a proposal (Paper Algo 5, Line 4).
+// Prevents a Byzantine proposer from sending multiple proposals in the same session.
+const deliveredProposals = new Map(); // sessionId -> sender
+
+// Install persistent handlers (once) that buffer messages by sessionId.
+// Session-specific resolve functions are stored and called when messages arrive.
+const proposalResolvers = new Map();   // sessionId -> (msg) => void
+const signerSetResolvers = new Map();  // sessionId -> (msg) => void
+
+let handlersInstalled = false;
+function installBufferingHandlers() {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+
+  onMessage('proposal', (msg) => {
+    const sid = msg.sessionId;
+
+    // Paper Algorithm 5, Line 4: require proposedId == null
+    // Reject duplicate proposals for the same session (Byzantine equivocation guard)
+    if (deliveredProposals.has(sid)) {
+      console.warn(`[Consensus] Rejecting duplicate proposal for session ${sid} from party ${msg.sender} (already received from ${deliveredProposals.get(sid)})`);
+      return;
+    }
+    deliveredProposals.set(sid, msg.sender);
+
+    const resolver = proposalResolvers.get(sid);
+    if (resolver) {
+      proposalResolvers.delete(sid);
+      resolver(msg);
+    } else {
+      // Buffer for later
+      proposalBuffer.set(sid, msg);
+    }
+  });
+
+  onMessage('signer_set', (msg) => {
+    const sid = msg.sessionId;
+    const resolver = signerSetResolvers.get(sid);
+    if (resolver) {
+      signerSetResolvers.delete(sid);
+      resolver(msg);
+    } else {
+      signerSetBuffer.set(sid, msg);
+    }
+  });
+}
+
+/**
+ * Wait for a proposal for a specific session.
+ * Checks the buffer first, then waits for the message to arrive.
+ */
+function waitForProposal(sessionId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    // Check buffer first
+    const buffered = proposalBuffer.get(sessionId);
+    if (buffered) {
+      proposalBuffer.delete(sessionId);
+      resolve(buffered);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      proposalResolvers.delete(sessionId);
+      reject(new Error('Consensus timeout'));
+    }, timeoutMs);
+
+    proposalResolvers.set(sessionId, (msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    });
+  });
+}
+
+/**
+ * Wait for a signer set for a specific session.
+ */
+function waitForSignerSet(sessionId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const buffered = signerSetBuffer.get(sessionId);
+    if (buffered) {
+      signerSetBuffer.delete(sessionId);
+      resolve(buffered);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      signerSetResolvers.delete(sessionId);
+      reject(new Error('Consensus timeout'));
+    }, timeoutMs);
+
+    signerSetResolvers.set(sessionId, (msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    });
+  });
+}
+
+/**
+ * Clean up stale buffer entries from previous sessions.
+ * Called at the start of each session to prevent unbounded memory growth.
+ * Keeps only entries from the last `keepCount` sessions.
+ *
+ * @param {number} currentCounter  The current session counter
+ * @param {number} keepCount       Number of recent sessions to keep (default 5)
+ */
+export function cleanupBuffers(currentCounter, keepCount = 5) {
+  const threshold = currentCounter - keepCount;
+  for (const map of [proposalBuffer, signerSetBuffer, deliveredProposals, proposalResolvers, signerSetResolvers]) {
+    for (const key of map.keys()) {
+      // Session IDs are formatted as SIGN_{chain}_{counter}
+      const parts = key.split('_');
+      const counter = parseInt(parts[parts.length - 1]);
+      if (!isNaN(counter) && counter < threshold) {
+        map.delete(key);
+      }
+    }
+  }
+}
 
 /**
  * Determine the session leader deterministically.
@@ -78,10 +205,24 @@ export async function runAsProposer(sessionId, destChain) {
   const deposit = deposits[0];
   console.log(`[Consensus] Proposing deposit #${deposit.id}: ${deposit.amount} ${deposit.source_chain} -> ${deposit.dest_chain}`);
 
-  // 2. Mark as processing
+  // 2. Mark as processing (update both DB and in-memory object)
   updateDepositStatus(deposit.id, 'processing');
+  deposit.status = 'processing';
 
-  // 3. Broadcast proposal
+  // Paper Algorithm 4, Line 4: compute signHash = targetClient.getHashOfWithdrawal()
+  // For EVM target chain, this is deterministic. For Zano, it depends on the unsigned tx
+  // which hasn't been created yet, so signHash is null for Zano direction.
+  let signHash = null;
+  if (destChain === 'evm') {
+    const evmTokenAddress = resolveEvmTokenAddress(deposit.token_address);
+    const txHash = ethers.zeroPadBytes(
+      deposit.tx_hash.startsWith('0x') ? deposit.tx_hash : '0x' + deposit.tx_hash, 32);
+    signHash = computeErc20SignHash(
+      evmTokenAddress, deposit.amount, deposit.receiver,
+      txHash, deposit.tx_nonce, config.evm.chainId, true);
+  }
+
+  // 3. Broadcast proposal (Paper Algorithm 4, Line 5-6)
   await broadcast({
     sessionId,
     type: 'proposal',
@@ -94,6 +235,7 @@ export async function runAsProposer(sessionId, destChain) {
       amount: deposit.amount,
       receiver: deposit.receiver,
       destChain: deposit.dest_chain,
+      signHash, // Paper Algo 4, Line 5: include signHash in proposal
     },
   });
 
@@ -156,157 +298,150 @@ export async function runAsProposer(sessionId, destChain) {
 export async function runAsAcceptor(sessionId) {
   console.log(`[Consensus] Running as ACCEPTOR for session ${sessionId}`);
 
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error('Consensus timeout'));
-    }, config.session.consensusTimeoutMs * 2);
+  installBufferingHandlers();
 
-    // Paper Algorithm 5, Line 2: proposedId ← ⊥ (track accepted proposal)
-    let acceptedDepositId = null;
-    let verifiedDeposit = null;
+  // 1. Wait for proposal (with buffer check)
+  let proposalMsg;
+  try {
+    proposalMsg = await waitForProposal(sessionId, config.session.consensusTimeoutMs * 2);
+  } catch {
+    throw new Error('Consensus timeout');
+  }
 
-    // Wait for proposal
-    onMessage('proposal', async (msg) => {
-      if (msg.sessionId !== sessionId) return;
+  console.log(`[Consensus] Received proposal from party ${proposalMsg.sender}`);
 
-      // Paper Algorithm 5, Line 4: require proposedId == ⊥
-      // Prevent accepting multiple proposals from a Byzantine proposer
-      if (acceptedDepositId !== null) {
-        console.log(`[Consensus] Rejecting duplicate proposal (already accepted ${acceptedDepositId})`);
-        return;
-      }
+  const { sourceChain, txHash, txNonce, depositId } = proposalMsg.data;
 
-      console.log(`[Consensus] Received proposal from party ${msg.sender}`);
+  // Paper Algorithm 5, Lines 5-11 + Algorithm 12/13:
+  // INDEPENDENTLY fetch deposit data from the chain.
+  let chainDepositData = null;
+  if (sourceChain === 'evm') {
+    chainDepositData = await getEvmDepositData(txHash, txNonce);
+  } else if (sourceChain === 'zano') {
+    chainDepositData = await getZanoDepositData(txHash);
+  }
 
-      const { sourceChain, txHash, txNonce, depositId } = msg.data;
+  const { sendToParty } = await import('./p2p.js');
 
-      // Paper Algorithm 5, Lines 5-11 + Algorithm 12/13:
-      // INDEPENDENTLY fetch deposit data from the chain.
-      // Do NOT trust the proposer's amount, receiver, or tokenAddress.
-      // This is critical for bridge safety (Theorem 4).
-      let chainDepositData = null;
+  if (!chainDepositData) {
+    console.log('[Consensus] NACK: could not independently verify deposit on-chain');
+    await sendToParty(proposalMsg.sender, {
+      sessionId,
+      type: 'proposal_response',
+      data: { accepted: false, reason: 'chain verification failed' },
+    });
+    return null;
+  }
 
-      if (sourceChain === 'evm') {
-        chainDepositData = await getEvmDepositData(txHash, txNonce);
-      } else if (sourceChain === 'zano') {
-        chainDepositData = await getZanoDepositData(txHash);
-      }
+  // Verify proposer's claimed data matches on-chain reality
+  const proposerData = proposalMsg.data;
+  const mismatch =
+    chainDepositData.amount !== proposerData.amount ||
+    chainDepositData.receiver !== proposerData.receiver ||
+    chainDepositData.tokenAddress?.toLowerCase() !== proposerData.tokenAddress?.toLowerCase();
 
-      if (!chainDepositData) {
-        console.log('[Consensus] NACK: could not independently verify deposit on-chain');
-        const { sendToParty } = await import('./p2p.js');
-        await sendToParty(msg.sender, {
-          sessionId,
-          type: 'proposal_response',
-          data: { accepted: false, reason: 'chain verification failed' },
-        });
-        return;
-      }
+  if (mismatch) {
+    console.error('[Consensus] NACK: proposer data does not match on-chain event!');
+    console.error(`  On-chain amount: ${chainDepositData.amount}, proposer claimed: ${proposerData.amount}`);
+    console.error(`  On-chain receiver: ${chainDepositData.receiver}, proposer claimed: ${proposerData.receiver}`);
+    await sendToParty(proposalMsg.sender, {
+      sessionId,
+      type: 'proposal_response',
+      data: { accepted: false, reason: 'data mismatch' },
+    });
+    return null;
+  }
 
-      // Verify proposer's claimed data matches on-chain reality
-      const proposerData = msg.data;
-      const mismatch =
-        chainDepositData.amount !== proposerData.amount ||
-        chainDepositData.receiver !== proposerData.receiver ||
-        chainDepositData.tokenAddress?.toLowerCase() !== proposerData.tokenAddress?.toLowerCase();
+  // Paper Algorithm 5, Line 11: verify signHash matches independently computed value.
+  // For EVM target chain, signHash is deterministic from deposit fields — acceptor
+  // recomputes from its own chain data and compares against proposer's claim.
+  // For Zano direction, signHash is null (depends on unsigned tx created during signing).
+  if (proposerData.signHash && chainDepositData.destChain === 'evm') {
+    const evmTokenAddress = resolveEvmTokenAddress(chainDepositData.tokenAddress);
+    const paddedTxHash = ethers.zeroPadBytes(
+      chainDepositData.txHash.startsWith('0x') ? chainDepositData.txHash : '0x' + chainDepositData.txHash, 32);
+    const acceptorSignHash = computeErc20SignHash(
+      evmTokenAddress, chainDepositData.amount, chainDepositData.receiver,
+      paddedTxHash, chainDepositData.txNonce ?? 0, config.evm.chainId, true);
 
-      if (mismatch) {
-        console.error('[Consensus] NACK: proposer data does not match on-chain event!');
-        console.error(`  On-chain amount: ${chainDepositData.amount}, proposer claimed: ${proposerData.amount}`);
-        console.error(`  On-chain receiver: ${chainDepositData.receiver}, proposer claimed: ${proposerData.receiver}`);
-        const { sendToParty } = await import('./p2p.js');
-        await sendToParty(msg.sender, {
-          sessionId,
-          type: 'proposal_response',
-          data: { accepted: false, reason: 'data mismatch' },
-        });
-        return;
-      }
-
-      // Go ref: signing/consensus.go VerifyProposedData() — check deposit isn't already processed.
-      // Paper Algorithm 5, Line 3: ensures we don't re-sign a finalized deposit.
-      const existingDeposit = getDepositByTxHash(
-        chainDepositData.sourceChain,
-        chainDepositData.txHash,
-        chainDepositData.txNonce ?? 0,
-      );
-      if (existingDeposit && existingDeposit.status !== 'pending') {
-        console.log(`[Consensus] NACK: deposit already ${existingDeposit.status} (${chainDepositData.txHash})`);
-        const { sendToParty } = await import('./p2p.js');
-        await sendToParty(msg.sender, {
-          sessionId,
-          type: 'proposal_response',
-          data: { accepted: false, reason: `already ${existingDeposit.status}` },
-        });
-        return;
-      }
-
-      // Store deposit using OUR independently verified data (not proposer's)
-      const { addDeposit: addDep } = await import('./db.js');
-      addDep(chainDepositData);
-
-      verifiedDeposit = chainDepositData;
-      acceptedDepositId = depositId ?? txHash; // Track which proposal we accepted
-
-      console.log(`[Consensus] ACK: independently verified deposit on-chain`);
-
-      // Send ACK to proposer
-      const { sendToParty } = await import('./p2p.js');
-      await sendToParty(msg.sender, {
+    if (acceptorSignHash !== proposerData.signHash) {
+      console.error('[Consensus] NACK: signHash mismatch!');
+      console.error(`  Acceptor computed: ${acceptorSignHash}`);
+      console.error(`  Proposer claimed:  ${proposerData.signHash}`);
+      await sendToParty(proposalMsg.sender, {
         sessionId,
         type: 'proposal_response',
-        data: { accepted: true },
+        data: { accepted: false, reason: 'signHash mismatch' },
       });
+      return null;
+    }
+    console.log(`[Consensus] signHash verified: ${acceptorSignHash.slice(0, 18)}...`);
+  }
+
+  // Check deposit isn't already processed
+  const existingDeposit = getDepositByTxHash(
+    chainDepositData.sourceChain,
+    chainDepositData.txHash,
+    chainDepositData.txNonce ?? 0,
+  );
+  if (existingDeposit && existingDeposit.status !== 'pending') {
+    console.log(`[Consensus] NACK: deposit already ${existingDeposit.status} (${chainDepositData.txHash})`);
+    await sendToParty(proposalMsg.sender, {
+      sessionId,
+      type: 'proposal_response',
+      data: { accepted: false, reason: `already ${existingDeposit.status}` },
     });
+    return null;
+  }
 
-    // Wait for signer set
-    onMessage('signer_set', (msg) => {
-      if (msg.sessionId !== sessionId) return;
+  // Store deposit using OUR independently verified data (not proposer's)
+  const { addDeposit: addDep } = await import('./db.js');
+  addDep(chainDepositData);
 
-      // Paper Algorithm 5, Line 16: require proposedId == signStartMsg.depositId
-      // Ensure the signer set references the deposit we accepted
-      const signerSetDepositId = msg.data.deposit?.id ?? msg.data.deposit?.tx_hash;
-      if (acceptedDepositId !== null && signerSetDepositId !== undefined) {
-        // Best-effort check: at minimum the tx_hash should match
-        const depositTxHash = msg.data.deposit?.tx_hash;
-        if (verifiedDeposit && depositTxHash !== verifiedDeposit.txHash) {
-          console.error('[Consensus] Rejecting signer_set: deposit mismatch');
-          return;
-        }
-      }
+  console.log(`[Consensus] ACK: independently verified deposit on-chain`);
 
-      clearTimeout(timeout);
-      console.log(`[Consensus] Received signer set: ${msg.data.signers.join(', ')}`);
-
-      // Use our independently verified deposit data (Paper Algorithm 5).
-      // CRITICAL: Map camelCase verified data to snake_case DB format used by signing code.
-      // Without this, the proposer's unverified token_address/tx_hash/amount
-      // would leak through because the merge wouldn't override (different key names).
-      //
-      // Go ref: acceptor.go — uses only independently verified deposit data for signing.
-      let deposit;
-      if (verifiedDeposit) {
-        deposit = {
-          ...msg.data.deposit,                          // DB id, status, etc. from proposer
-          source_chain: verifiedDeposit.sourceChain,    // Override with verified data
-          tx_hash: verifiedDeposit.txHash,
-          tx_nonce: verifiedDeposit.txNonce,
-          token_address: verifiedDeposit.tokenAddress,
-          amount: verifiedDeposit.amount,
-          sender: verifiedDeposit.sender,
-          receiver: verifiedDeposit.receiver,
-          dest_chain: verifiedDeposit.destChain,
-        };
-      } else {
-        deposit = msg.data.deposit;
-      }
-
-      resolve({
-        deposit,
-        signers: msg.data.signers,
-      });
-    });
+  // Send ACK to proposer
+  await sendToParty(proposalMsg.sender, {
+    sessionId,
+    type: 'proposal_response',
+    data: { accepted: true },
   });
+
+  // 2. Wait for signer set
+  let signerSetMsg;
+  try {
+    signerSetMsg = await waitForSignerSet(sessionId, config.session.consensusTimeoutMs * 2);
+  } catch {
+    throw new Error('Consensus timeout waiting for signer set');
+  }
+
+  // Paper Algorithm 5, Line 16: validate signer set references our accepted deposit
+  const depositTxHash = signerSetMsg.data.deposit?.tx_hash;
+  if (depositTxHash && depositTxHash !== chainDepositData.txHash) {
+    console.error('[Consensus] Rejecting signer_set: deposit mismatch');
+    return null;
+  }
+
+  console.log(`[Consensus] Received signer set: ${signerSetMsg.data.signers.join(', ')}`);
+
+  // Use our independently verified deposit data (Paper Algorithm 5).
+  // Map camelCase verified data to snake_case DB format used by signing code.
+  const deposit = {
+    ...signerSetMsg.data.deposit,
+    source_chain: chainDepositData.sourceChain,
+    tx_hash: chainDepositData.txHash,
+    tx_nonce: chainDepositData.txNonce,
+    token_address: chainDepositData.tokenAddress,
+    amount: chainDepositData.amount,
+    sender: chainDepositData.sender,
+    receiver: chainDepositData.receiver,
+    dest_chain: chainDepositData.destChain,
+  };
+
+  return {
+    deposit,
+    signers: signerSetMsg.data.signers,
+  };
 }
 
 /**

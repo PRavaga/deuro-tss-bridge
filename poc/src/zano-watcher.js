@@ -89,18 +89,36 @@ export async function pollZanoDeposits() {
  *   - Validates confirmations
  */
 function processBurnTransaction(tx, confirmedHeight) {
-  // Must be an asset burn operation
-  if (!tx.ado || tx.ado.operation_type !== OPERATION_TYPE_BURN) return null;
-  if (!tx.ado.opt_amount || !tx.ado.opt_asset_id) return null;
-
-  // Must be for our asset
-  if (tx.ado.opt_asset_id !== config.zano.assetId) return null;
-
   // Must be confirmed
   if (!tx.height || tx.height > confirmedHeight) return null;
 
   // Already processed?
   if (getDepositByTxHash('zano', tx.tx_hash, 0)) return null;
+
+  // Two detection paths:
+  // 1. ado-based: burn_asset RPC populates tx.ado with operation_type=4
+  // 2. Service-entry-based: transfer RPC with asset_id_to_burn populates service_entries
+  //    but NOT ado. The burn amount/asset are in the service entry memo body.
+
+  let tokenAddress, burnAmount;
+
+  if (tx.ado && tx.ado.operation_type === OPERATION_TYPE_BURN) {
+    // Path 1: ado-based detection (burn_asset RPC)
+    if (!tx.ado.opt_amount || !tx.ado.opt_asset_id) return null;
+    if (tx.ado.opt_asset_id !== config.zano.assetId) return null;
+    tokenAddress = tx.ado.opt_asset_id;
+    burnAmount = tx.ado.opt_amount;
+  } else {
+    // Path 2: service-entry-based detection (transfer with asset_id_to_burn)
+    // Skip if no service entries with bridge marker
+    if (!hasBridgeServiceEntry(tx)) return null;
+    // Amount and asset come from the memo body
+    const memo = extractDepositMemo(tx);
+    if (!memo || !memo.amt || !memo.asset_id) return null;
+    if (memo.asset_id !== config.zano.assetId) return null;
+    tokenAddress = memo.asset_id;
+    burnAmount = memo.amt;
+  }
 
   // Extract deposit memo from service entries
   const memo = extractDepositMemo(tx);
@@ -122,17 +140,26 @@ function processBurnTransaction(tx, confirmedHeight) {
     sourceChain: 'zano',
     txHash: tx.tx_hash,
     txNonce: 0,
-    tokenAddress: tx.ado.opt_asset_id,
-    amount: String(tx.ado.opt_amount),
+    tokenAddress,
+    amount: String(burnAmount),
     sender: tx.remote_addresses?.[0] ?? '',
     receiver: memo.dst_add,
     destChain: 'evm',
   };
 
   addDeposit(deposit);
-  console.log(`[Zano Watcher] New burn: ${tx.ado.opt_amount} -> ${memo.dst_add} (EVM)`);
+  console.log(`[Zano Watcher] New burn: ${burnAmount} -> ${memo.dst_add} (EVM)`);
 
   return deposit;
+}
+
+/**
+ * Check if a transaction has a bridge service entry (service_id='X', instruction='D').
+ * Used to detect burns made via `transfer` with `asset_id_to_burn`.
+ */
+function hasBridgeServiceEntry(tx) {
+  if (!tx.service_entries || tx.service_entries.length === 0) return false;
+  return tx.service_entries.some(e => e.service_id === 'X' && e.instruction === 'D');
 }
 
 /**
@@ -174,7 +201,10 @@ export async function verifyZanoBurn(txHash) {
     const tx = allTxs.find(t => t.tx_hash === txHash);
     if (!tx) return false;
 
-    if (!tx.ado || tx.ado.operation_type !== OPERATION_TYPE_BURN) return false;
+    // Accept either ado-based burns or service-entry-based burns
+    const isAdoBurn = tx.ado && tx.ado.operation_type === OPERATION_TYPE_BURN;
+    const isServiceBurn = hasBridgeServiceEntry(tx);
+    if (!isAdoBurn && !isServiceBurn) return false;
 
     const currentHeight = await getHeight();
     if (tx.height + config.zano.confirmations > currentHeight) return false;
@@ -205,10 +235,22 @@ export async function getZanoDepositData(txHash) {
     const tx = allTxs.find(t => t.tx_hash === txHash);
     if (!tx) return null;
 
-    // Algorithm 13, Line 9: require operationType == BURN
-    if (!tx.ado || tx.ado.operation_type !== OPERATION_TYPE_BURN) return null;
-    // Algorithm 13, Line 10: require optAssetId != null and optAmount != null
-    if (!tx.ado.opt_asset_id || !tx.ado.opt_amount) return null;
+    let tokenAddress, burnAmount;
+
+    if (tx.ado && tx.ado.operation_type === OPERATION_TYPE_BURN) {
+      // Path 1: ado-based (burn_asset RPC)
+      if (!tx.ado.opt_asset_id || !tx.ado.opt_amount) return null;
+      tokenAddress = tx.ado.opt_asset_id;
+      burnAmount = tx.ado.opt_amount;
+    } else if (hasBridgeServiceEntry(tx)) {
+      // Path 2: service-entry-based (transfer with asset_id_to_burn)
+      const memoData = extractDepositMemo(tx);
+      if (!memoData || !memoData.amt || !memoData.asset_id) return null;
+      tokenAddress = memoData.asset_id;
+      burnAmount = memoData.amt;
+    } else {
+      return null;
+    }
 
     // Algorithm 13, Line 7: confirmations check
     const currentHeight = await getHeight();
@@ -223,8 +265,8 @@ export async function getZanoDepositData(txHash) {
       sourceChain: 'zano',
       txHash: tx.tx_hash,
       txNonce: 0,
-      tokenAddress: tx.ado.opt_asset_id,
-      amount: String(tx.ado.opt_amount),
+      tokenAddress,
+      amount: String(burnAmount),
       sender: tx.remote_addresses?.[0] ?? '',
       receiver: memo.dst_add,
       destChain: 'evm',

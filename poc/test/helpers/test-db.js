@@ -50,14 +50,6 @@ export function createTestDb() {
       UNIQUE(source_chain, tx_hash, tx_nonce)
     );
 
-    CREATE TABLE IF NOT EXISTS sessions (
-      id INTEGER PRIMARY KEY,
-      session_id TEXT NOT NULL UNIQUE,
-      leader_id INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      deposit_id INTEGER REFERENCES deposits(id),
-      created_at INTEGER DEFAULT (unixepoch())
-    );
   `);
 
   // ---- CRUD functions (same signatures as src/db.js) ----
@@ -75,7 +67,10 @@ export function createTestDb() {
   function getPendingDeposits(destChain) {
     return db.prepare(`
       SELECT * FROM deposits
-      WHERE dest_chain = ? AND status = 'pending'
+      WHERE dest_chain = ? AND (
+        status = 'pending'
+        OR (status = 'signed' AND updated_at < unixepoch() - 60)
+      )
       ORDER BY id ASC
       LIMIT 1
     `).all(destChain);

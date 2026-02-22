@@ -32,13 +32,14 @@ export EVM_CONFIRMATIONS="${EVM_CONFIRMATIONS:-2}"
 export ZANO_CONFIRMATIONS="${ZANO_CONFIRMATIONS:-2}"
 
 # Use defaults from .env.example if not set
-export EVM_RPC="${EVM_RPC:-https://rpc.sepolia.org}"
-export BRIDGE_ADDRESS="${BRIDGE_ADDRESS:-0x72D501f30325aE86C6E2Bb2b50C73d688aa3a09e}"
-export DEURO_TOKEN="${DEURO_TOKEN:-0xa7ff975db5AF3Ca92D7983ef944a636Ca962CB60}"
+export EVM_RPC="${EVM_RPC:-https://eth-sepolia.g.alchemy.com/v2/z97HTgIuGjc4F_sD1-0EZ}"
+export BRIDGE_ADDRESS="${BRIDGE_ADDRESS:-0x7a40738f7914F6Cc8d283e117b00fFE5e19250B5}"
+export DEURO_TOKEN="${DEURO_TOKEN:-0x90e4bEE191fD540954D9843a21C11C9f74a16776}"
 export ZANO_DAEMON_RPC="${ZANO_DAEMON_RPC:-http://127.0.0.1:12111/json_rpc}"
 export ZANO_WALLET_RPC="${ZANO_WALLET_RPC:-http://127.0.0.1:12212/json_rpc}"
-export ZANO_ASSET_ID="${ZANO_ASSET_ID:-ff36665da627f7f09a1fd8e9450d37ed19f92b2021d84a74a76e1c347c52603c}"
+export ZANO_ASSET_ID="${ZANO_ASSET_ID:-15c077f777a99ab1af8c28eaee8532185ad005af16ada32a668f94ce06c6d0d7}"
 export P2P_API_KEY="${P2P_API_KEY:-deuro-poc-key-change-me}"
+export DEPLOYER_PRIVATE_KEY="${DEPLOYER_PRIVATE_KEY:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -104,13 +105,17 @@ check_prereqs() {
   fi
 }
 
-# --- Generate keys if missing ---
+# --- Check TSS keyshares exist ---
 
 ensure_keys() {
-  if [ ! -f "$DIR/data/party-keys.json" ]; then
-    log "Generating party keys..."
-    node src/keygen.js
-  fi
+  for i in 0 1 2; do
+    if [ ! -f "$DIR/data/keyshare-$i.bin" ]; then
+      err "Missing keyshare: data/keyshare-$i.bin"
+      err "Run DKG first: for i in 0 1 2; do PARTY_ID=\$i node src/keygen.js & done"
+      exit 1
+    fi
+  done
+  log "TSS keyshares found for all 3 parties"
 }
 
 # --- Start parties ---
@@ -128,6 +133,7 @@ start_parties() {
       P2P_API_KEY="$P2P_API_KEY" \
       EVM_CONFIRMATIONS="$EVM_CONFIRMATIONS" \
       ZANO_CONFIRMATIONS="$ZANO_CONFIRMATIONS" \
+      DEPLOYER_PRIVATE_KEY="$DEPLOYER_PRIVATE_KEY" \
       node src/party.js > "/tmp/e2e-party-$i.log" 2>&1 &
     PARTY_PIDS+=($!)
     log "  Party $i started (PID $!) -> /tmp/e2e-party-$i.log"

@@ -2,12 +2,13 @@
 # Start all 3 bridge parties in background, logs to /tmp/party-*.log
 # Usage: ./scripts/run-parties.sh [start|stop|status|logs]
 
-BRIDGE_ADDRESS="0x72D501f30325aE86C6E2Bb2b50C73d688aa3a09e"
+BRIDGE_ADDRESS="0x7a40738f7914F6Cc8d283e117b00fFE5e19250B5"
 EVM_RPC="https://eth-sepolia.g.alchemy.com/v2/z97HTgIuGjc4F_sD1-0EZ"
 ZANO_DAEMON_RPC="http://127.0.0.1:12111/json_rpc"
 ZANO_WALLET_RPC="http://127.0.0.1:12212/json_rpc"
-ZANO_ASSET_ID="ff36665da627f7f09a1fd8e9450d37ed19f92b2021d84a74a76e1c347c52603c"
-DEURO_TOKEN="${DEURO_TOKEN:-0xa7ff975db5AF3Ca92D7983ef944a636Ca962CB60}"
+ZANO_ASSET_ID="15c077f777a99ab1af8c28eaee8532185ad005af16ada32a668f94ce06c6d0d7"
+DEURO_TOKEN="${DEURO_TOKEN:-0x90e4bEE191fD540954D9843a21C11C9f74a16776}"
+DEPLOYER_PRIVATE_KEY="${DEPLOYER_PRIVATE_KEY:-}"
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -21,6 +22,7 @@ start() {
       ZANO_WALLET_RPC=$ZANO_WALLET_RPC \
       ZANO_ASSET_ID=$ZANO_ASSET_ID \
       DEURO_TOKEN=$DEURO_TOKEN \
+      DEPLOYER_PRIVATE_KEY=$DEPLOYER_PRIVATE_KEY \
       node "$DIR/src/party.js" > "/tmp/party-$i.log" 2>&1 &
     echo "  PID: $! -> /tmp/party-$i.log"
   done

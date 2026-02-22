@@ -62,9 +62,9 @@ export const config = {
 
   // Session timing
   session: {
-    intervalMs: 60_000,       // New signing session every 60 seconds
-    consensusTimeoutMs: 10_000,  // 10 seconds for consensus
-    signingTimeoutMs: 30_000,    // 30 seconds for TSS signing (more rounds than before)
+    intervalMs: parseInt(process.env.SESSION_INTERVAL_MS ?? '60000'),
+    consensusTimeoutMs: parseInt(process.env.CONSENSUS_TIMEOUT_MS ?? '10000'),
+    signingTimeoutMs: parseInt(process.env.SIGNING_TIMEOUT_MS ?? '30000'),
   },
 
   // Token mapping: Zano asset ID -> EVM token address

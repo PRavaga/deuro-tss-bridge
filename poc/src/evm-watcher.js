@@ -11,7 +11,7 @@ import { addDeposit, getDepositByTxHash } from './db.js';
 
 // Bridge contract ABI (deposit events only)
 const BRIDGE_ABI = [
-  'event DepositedERC20(address token, uint256 amount, string receiver, string network, bool isWrapped, uint16 referralId)',
+  'event DepositedERC20(address indexed token, uint256 amount, string receiver, string network, bool isWrapped, uint16 referralId)',
   'event DepositedNative(uint256 amount, string receiver, string network, uint16 referralId)',
 ];
 
@@ -201,15 +201,16 @@ export async function verifyEvmDeposit(txHash, txNonce) {
     const currentBlock = await provider.getBlockNumber();
     if (receipt.blockNumber + config.evm.confirmations > currentBlock) return false;
 
-    // Check log exists at txNonce index
-    if (txNonce >= receipt.logs.length) return false;
+    // Verify at least one log is from the bridge contract
+    let bridgeEventCount = 0;
+    for (const log of receipt.logs) {
+      if (log.address.toLowerCase() === config.evm.bridgeAddress.toLowerCase()) {
+        if (bridgeEventCount === txNonce) return true;
+        bridgeEventCount++;
+      }
+    }
 
-    const log = receipt.logs[txNonce];
-
-    // Verify it's from the bridge contract
-    if (log.address.toLowerCase() !== config.evm.bridgeAddress.toLowerCase()) return false;
-
-    return true;
+    return false;
   } catch (err) {
     console.error('[EVM Watcher] Verify error:', err.message);
     return false;
@@ -240,43 +241,51 @@ export async function getEvmDepositData(txHash, txNonce) {
     const currentBlock = await provider.getBlockNumber();
     if (receipt.blockNumber + config.evm.confirmations > currentBlock) return null;
 
-    // Parse the event at txNonce index (Algorithm 12, Line 9)
-    if (txNonce >= receipt.logs.length) return null;
-    const log = receipt.logs[txNonce];
-
-    if (log.address.toLowerCase() !== config.evm.bridgeAddress.toLowerCase()) return null;
-
-    // Try parsing as DepositedERC20 first, then DepositedNative
+    // Scan all logs in the receipt for bridge events.
+    // A deposit tx may contain multiple logs (e.g. ERC20 Transfer + bridge DepositedERC20),
+    // so we search by contract address rather than using txNonce as a direct index.
     const iface = bridgeContract.interface;
-    let parsed;
-    try {
-      parsed = iface.parseLog({ topics: log.topics, data: log.data });
-    } catch {
-      return null;
-    }
+    let bridgeEventCount = 0;
 
-    if (parsed.name === 'DepositedERC20') {
-      return {
-        sourceChain: 'evm',
-        txHash,
-        txNonce,
-        tokenAddress: parsed.args.token,
-        amount: parsed.args.amount.toString(),
-        sender: tx?.from ?? '',
-        receiver: parsed.args.receiver,
-        destChain: parsed.args.network?.toLowerCase() ?? 'zano',
-      };
-    } else if (parsed.name === 'DepositedNative') {
-      return {
-        sourceChain: 'evm',
-        txHash,
-        txNonce,
-        tokenAddress: ethers.ZeroAddress,
-        amount: parsed.args.amount.toString(),
-        sender: tx?.from ?? '',
-        receiver: parsed.args.receiver,
-        destChain: parsed.args.network?.toLowerCase() ?? 'zano',
-      };
+    for (const log of receipt.logs) {
+      if (log.address.toLowerCase() !== config.evm.bridgeAddress.toLowerCase()) continue;
+
+      let parsed;
+      try {
+        parsed = iface.parseLog({ topics: log.topics, data: log.data });
+      } catch {
+        continue;
+      }
+
+      // Match the Nth bridge event (txNonce = bridge-event-relative index)
+      if (bridgeEventCount !== txNonce) {
+        bridgeEventCount++;
+        continue;
+      }
+
+      if (parsed.name === 'DepositedERC20') {
+        return {
+          sourceChain: 'evm',
+          txHash,
+          txNonce,
+          tokenAddress: parsed.args.token,
+          amount: parsed.args.amount.toString(),
+          sender: tx?.from ?? '',
+          receiver: parsed.args.receiver,
+          destChain: parsed.args.network?.toLowerCase() ?? 'zano',
+        };
+      } else if (parsed.name === 'DepositedNative') {
+        return {
+          sourceChain: 'evm',
+          txHash,
+          txNonce,
+          tokenAddress: ethers.ZeroAddress,
+          amount: parsed.args.amount.toString(),
+          sender: tx?.from ?? '',
+          receiver: parsed.args.receiver,
+          destChain: parsed.args.network?.toLowerCase() ?? 'zano',
+        };
+      }
     }
 
     return null;

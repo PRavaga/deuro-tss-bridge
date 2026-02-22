@@ -6,6 +6,7 @@ typechain-types/
 *.db-shm
 *.db-wal
 party-keys.json
+data/
 .env
 *.log
 zano-testnet/
