@@ -96,28 +96,45 @@ function processBurnTransaction(tx, confirmedHeight) {
   if (getDepositByTxHash('zano', tx.tx_hash, 0)) return null;
 
   // Two detection paths:
-  // 1. ado-based: burn_asset RPC populates tx.ado with operation_type=4
+  // 1. ado-based: burn_asset RPC populates tx.ado with operation_type=4 — amount is chain-verified
   // 2. Service-entry-based: transfer RPC with asset_id_to_burn populates service_entries
   //    but NOT ado. The burn amount/asset are in the service entry memo body.
+  //
+  // TRUST MODEL for Path 2: The memo amount is user-supplied, NOT chain-verified.
+  // Zano's wallet RPC does not expose amount_to_burn in subtransfers for transfer-based burns.
+  // We cross-check against subtransfers where possible, but if the burned asset isn't present,
+  // we must trust the memo. Production Bridgeless (tss-svc) handles this at the daemon level.
 
   let tokenAddress, burnAmount;
 
   if (tx.ado && tx.ado.operation_type === OPERATION_TYPE_BURN) {
-    // Path 1: ado-based detection (burn_asset RPC)
+    // Path 1: ado-based detection (burn_asset RPC) — CHAIN-VERIFIED amount
     if (!tx.ado.opt_amount || !tx.ado.opt_asset_id) return null;
     if (tx.ado.opt_asset_id !== config.zano.assetId) return null;
     tokenAddress = tx.ado.opt_asset_id;
     burnAmount = tx.ado.opt_amount;
   } else {
     // Path 2: service-entry-based detection (transfer with asset_id_to_burn)
-    // Skip if no service entries with bridge marker
     if (!hasBridgeServiceEntry(tx)) return null;
-    // Amount and asset come from the memo body
     const memo = extractDepositMemo(tx);
     if (!memo || !memo.amt || !memo.asset_id) return null;
     if (memo.asset_id !== config.zano.assetId) return null;
     tokenAddress = memo.asset_id;
-    burnAmount = memo.amt;
+
+    // Try to cross-verify memo amount against subtransfers (chain data).
+    // For transfer-based burns, the burned asset may appear in subtransfers_by_pid.
+    const verifiedAmount = getSubtransferAmount(tx, config.zano.assetId);
+    if (verifiedAmount !== null) {
+      // Chain-verified amount available — use it, warn if memo disagrees
+      if (String(verifiedAmount) !== String(memo.amt)) {
+        console.warn(`[Zano Watcher] Memo amt ${memo.amt} != chain subtransfer ${verifiedAmount} for ${tx.tx_hash}, using chain value`);
+      }
+      burnAmount = verifiedAmount;
+    } else {
+      // No chain-verified amount — memo is the only source.
+      // This is safe in the PoC (same wallet), but production must verify via daemon.
+      burnAmount = memo.amt;
+    }
   }
 
   // Extract deposit memo from service entries
@@ -160,6 +177,27 @@ function processBurnTransaction(tx, confirmedHeight) {
 function hasBridgeServiceEntry(tx) {
   if (!tx.service_entries || tx.service_entries.length === 0) return false;
   return tx.service_entries.some(e => e.service_id === 'X' && e.instruction === 'D');
+}
+
+/**
+ * Extract the outgoing subtransfer amount for a specific asset from chain data.
+ * Returns the amount if found, null if the asset isn't in subtransfers.
+ *
+ * Zano's wallet RPC includes subtransfers_by_pid which contains chain-verified
+ * transfer amounts. For ado-based burns, the burned asset appears here.
+ * For transfer-based burns, current Zano versions may NOT include the burned
+ * asset in subtransfers (only the fee appears).
+ */
+function getSubtransferAmount(tx, assetId) {
+  const groups = tx.subtransfers_by_pid || [];
+  for (const group of groups) {
+    for (const sub of (group.subtransfers || [])) {
+      if (sub.asset_id === assetId && !sub.is_income) {
+        return sub.amount;
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -247,7 +285,17 @@ export async function getZanoDepositData(txHash) {
       const memoData = extractDepositMemo(tx);
       if (!memoData || !memoData.amt || !memoData.asset_id) return null;
       tokenAddress = memoData.asset_id;
-      burnAmount = memoData.amt;
+
+      // Cross-verify memo amount against subtransfers where possible
+      const verifiedAmount = getSubtransferAmount(tx, config.zano.assetId);
+      if (verifiedAmount !== null) {
+        if (String(verifiedAmount) !== String(memoData.amt)) {
+          console.warn(`[Zano Watcher] getZanoDepositData: memo amt ${memoData.amt} != chain ${verifiedAmount} for ${txHash}`);
+        }
+        burnAmount = verifiedAmount;
+      } else {
+        burnAmount = memoData.amt;
+      }
     } else {
       return null;
     }

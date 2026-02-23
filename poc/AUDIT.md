@@ -194,6 +194,8 @@ implementation (`bridgeless/tss-svc`).
 
 **Extension**: PoC supports two burn detection paths (ado-based and service-entry-based), discovered during E2E testing. The paper only describes ado-based (operationType == BURN). The service-entry path handles burns made via `transfer` with `asset_id_to_burn`, which is how the Zano wallet CLI actually works.
 
+**Trust model**: Path 1 (ado) provides a chain-verified burn amount via `tx.ado.opt_amount`. Path 2 (service-entry) reads the amount from the user-supplied memo body. The PoC cross-checks against `tx.subtransfers_by_pid` where available, but current Zano wallet RPC versions do not include the burned asset in subtransfers for transfer-based burns (only the fee appears). Production Bridgeless (`tss-svc`) verifies burn amounts at the daemon level.
+
 ---
 
 ## 3. PoC vs Go Reference Implementation
