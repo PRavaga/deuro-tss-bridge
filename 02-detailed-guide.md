@@ -878,9 +878,9 @@ func convertToEthSignature(sig *common.SignatureData) string {
 
 ## 9. Security
 
-### 9.1 Formal verification
+### 9.1 Paper reference
 
-The bridge is formally verified against the Bridgeless security paper (arXiv 2506.19730). Every algorithm and theorem has been cross-referenced line-by-line.
+The bridge was built by referencing the Bridgeless security paper (arXiv 2506.19730). Algorithms and theorems were cross-referenced with the implementation.
 
 | Theorem | Property | Implementation |
 |---------|----------|----------------|

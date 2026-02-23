@@ -1,7 +1,7 @@
 # deuro TSS Bridge PoC
 
 2-of-3 threshold signature bridge between EVM (Sepolia) and Zano testnet.
-Audited against the [Bridgeless security paper](https://arxiv.org/abs/2506.19730) and the production Go implementation.
+Built by referencing the [Bridgeless security paper](https://arxiv.org/abs/2506.19730) and the production Go implementation.
 
 ## Architecture
 
