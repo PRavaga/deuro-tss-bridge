@@ -505,6 +505,19 @@ async function submitEvmWithdrawal(deposit, sigResult) {
       data: { depositTxHash: deposit.tx_hash, depositTxNonce: deposit.tx_nonce, sourceChain: deposit.source_chain },
     });
   } catch (err) {
+    // If the contract says "already processed", this deposit was finalized
+    // in a previous run. Mark as finalized instead of retrying endlessly.
+    if (err.message && err.message.includes('already processed')) {
+      updateDepositStatus(deposit.id, 'finalized');
+      console.log(`[EVM Submit] Deposit already processed on-chain, marked as finalized`);
+      // Notify other parties so they stop retrying too
+      await broadcast({
+        type: 'deposit_finalized',
+        sessionId: `evm_finalized_${deposit.tx_hash}`,
+        data: { depositTxHash: deposit.tx_hash, depositTxNonce: deposit.tx_nonce, sourceChain: deposit.source_chain },
+      });
+      return;
+    }
     console.error('[EVM Submit] Failed:', err.message);
     // Paper Algorithm 3, Line 40: reset to PENDING on finalization failure
     // so the deposit can be retried in a future session

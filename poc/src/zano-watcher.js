@@ -15,6 +15,9 @@ import { searchForTransactions, getHeight } from './zano-rpc.js';
 const OPERATION_TYPE_BURN = 4;
 
 let lastCheckedHeight = 0;
+// Minimum height filter: skip burns below this height on startup.
+// Set via ZANO_START_HEIGHT env var to avoid re-processing old wallet history.
+let minHeight = 0;
 
 /**
  * Initialize the Zano watcher.
@@ -28,6 +31,12 @@ export async function initZanoWatcher() {
   try {
     const height = await getHeight();
     lastCheckedHeight = height;
+
+    if (process.env.ZANO_START_HEIGHT) {
+      minHeight = parseInt(process.env.ZANO_START_HEIGHT);
+      console.log(`[Zano Watcher] Filtering burns below height ${minHeight}`);
+    }
+
     console.log(`[Zano Watcher] Started at height ${height}`);
     console.log(`[Zano Watcher] Monitoring asset: ${config.zano.assetId}`);
   } catch (err) {
@@ -91,6 +100,9 @@ export async function pollZanoDeposits() {
 function processBurnTransaction(tx, confirmedHeight) {
   // Must be confirmed
   if (!tx.height || tx.height > confirmedHeight) return null;
+
+  // Skip burns below minimum height (avoids re-processing old wallet history on restart)
+  if (minHeight > 0 && tx.height < minHeight) return null;
 
   // Already processed?
   if (getDepositByTxHash('zano', tx.tx_hash, 0)) return null;
