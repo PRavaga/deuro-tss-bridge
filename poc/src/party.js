@@ -34,6 +34,7 @@ import { formSigningData } from './zano-rpc.js';
 import { ethers } from 'ethers';
 
 let sessionCounter = 0;
+let lastEpoch = -1;
 
 async function main() {
   // Initialize TSS WASM
@@ -82,16 +83,17 @@ async function main() {
   await sleep(5000);
 
   while (true) {
-    const sessionStart = Date.now();
     try {
       await runSigningSession();
     } catch (err) {
       console.error('[Main] Session error:', err.message);
     }
-    // Wall-clock aligned sleep: subtract session execution time to prevent drift
-    const elapsed = Date.now() - sessionStart;
-    const remaining = Math.max(1000, config.session.intervalMs - elapsed);
-    await sleep(remaining);
+    // Sleep until next epoch boundary so all parties wake at the same wall-clock instant.
+    // This replaces the old "subtract elapsed" approach which drifted over long runs.
+    const now = Date.now();
+    const currentEpoch = Math.floor(now / config.session.intervalMs);
+    const nextEpochStart = (currentEpoch + 1) * config.session.intervalMs;
+    await sleep(Math.max(1000, nextEpochStart - now));
   }
 }
 
@@ -100,7 +102,14 @@ async function main() {
  * Handles both directions: EVM->Zano and Zano->EVM.
  */
 async function runSigningSession() {
-  sessionCounter++;
+  // Time-based epoch: all parties derive the same session counter from wall-clock time.
+  // This prevents session drift that occurred with simple incrementing counters —
+  // after hours of running, variable execution times caused parties to diverge by
+  // 20+ sessions, making consensus impossible until restart.
+  const epoch = Math.floor(Date.now() / config.session.intervalMs);
+  if (epoch === lastEpoch) return; // Already processed this epoch
+  lastEpoch = epoch;
+  sessionCounter = epoch;
 
   // Clean up stale consensus buffers from old sessions
   cleanupBuffers(sessionCounter);
@@ -140,21 +149,25 @@ async function runSigningSession() {
       continue;
     }
 
+    // Use the actual session ID from consensus (may differ from ours by ±1 epoch
+    // if the proposer's clock diverges slightly)
+    const actualSessionId = result.sessionId || sessionId;
+
     // Signing phase (Paper Algorithm 6)
     const amISigner = result.signers.includes(config.partyId);
 
     if (amISigner) {
       console.log('[Session] Selected as signer, running TSS signing phase');
       if (destChain === 'zano') {
-        await handleZanoSigning(sessionId, result);
+        await handleZanoSigning(actualSessionId, result);
       } else {
-        await handleEvmSigning(sessionId, result);
+        await handleEvmSigning(actualSessionId, result);
       }
     } else {
       // Paper Algorithm 6, Lines 6-10: non-signers wait for signature broadcast,
       // verify it, and participate in finalization
       console.log('[Session] Not selected as signer, waiting for signature broadcast');
-      await handleSignatureBroadcast(sessionId, result, destChain);
+      await handleSignatureBroadcast(actualSessionId, result, destChain);
     }
   }
 }

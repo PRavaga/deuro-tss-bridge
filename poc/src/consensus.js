@@ -87,52 +87,87 @@ function installBufferingHandlers() {
 }
 
 /**
- * Wait for a proposal for a specific session.
+ * Compute adjacent session IDs (±1 epoch) for clock-drift tolerance.
+ * If server clocks diverge, the proposer's epoch may differ from ours by 1.
+ * Checking adjacent epochs prevents missed proposals due to NTP drift or
+ * epoch-boundary timing.
+ */
+function getAdjacentSessionIds(sessionId) {
+  const parts = sessionId.split('_');
+  const counter = parseInt(parts[parts.length - 1]);
+  const prefix = parts.slice(0, -1).join('_');
+  return [
+    sessionId,
+    `${prefix}_${counter - 1}`,
+    `${prefix}_${counter + 1}`,
+  ];
+}
+
+/**
+ * Wait for a proposal for a specific session (or adjacent epoch ±1).
  * Checks the buffer first, then waits for the message to arrive.
+ * Returns the proposal with the proposer's actual session ID.
  */
 function waitForProposal(sessionId, timeoutMs) {
   return new Promise((resolve, reject) => {
-    // Check buffer first
-    const buffered = proposalBuffer.get(sessionId);
-    if (buffered) {
-      proposalBuffer.delete(sessionId);
-      resolve(buffered);
-      return;
+    const candidates = getAdjacentSessionIds(sessionId);
+
+    // Check buffer for exact match first, then adjacent
+    for (const sid of candidates) {
+      const buffered = proposalBuffer.get(sid);
+      if (buffered) {
+        proposalBuffer.delete(sid);
+        resolve(buffered);
+        return;
+      }
     }
 
     const timer = setTimeout(() => {
-      proposalResolvers.delete(sessionId);
+      for (const sid of candidates) proposalResolvers.delete(sid);
       reject(new Error('Consensus timeout'));
     }, timeoutMs);
 
-    proposalResolvers.set(sessionId, (msg) => {
+    // Register resolvers for all candidate sessions
+    const onResolved = (msg) => {
       clearTimeout(timer);
+      for (const sid of candidates) proposalResolvers.delete(sid);
       resolve(msg);
-    });
+    };
+    for (const sid of candidates) {
+      proposalResolvers.set(sid, onResolved);
+    }
   });
 }
 
 /**
- * Wait for a signer set for a specific session.
+ * Wait for a signer set for a specific session (or adjacent epoch ±1).
  */
 function waitForSignerSet(sessionId, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const buffered = signerSetBuffer.get(sessionId);
-    if (buffered) {
-      signerSetBuffer.delete(sessionId);
-      resolve(buffered);
-      return;
+    const candidates = getAdjacentSessionIds(sessionId);
+
+    for (const sid of candidates) {
+      const buffered = signerSetBuffer.get(sid);
+      if (buffered) {
+        signerSetBuffer.delete(sid);
+        resolve(buffered);
+        return;
+      }
     }
 
     const timer = setTimeout(() => {
-      signerSetResolvers.delete(sessionId);
+      for (const sid of candidates) signerSetResolvers.delete(sid);
       reject(new Error('Consensus timeout'));
     }, timeoutMs);
 
-    signerSetResolvers.set(sessionId, (msg) => {
+    const onResolved = (msg) => {
       clearTimeout(timer);
+      for (const sid of candidates) signerSetResolvers.delete(sid);
       resolve(msg);
-    });
+    };
+    for (const sid of candidates) {
+      signerSetResolvers.set(sid, onResolved);
+    }
   });
 }
 
@@ -308,6 +343,13 @@ export async function runAsAcceptor(sessionId) {
     throw new Error('Consensus timeout');
   }
 
+  // Use the proposer's session ID for all subsequent messages.
+  // With time-based epochs, the proposer may be ±1 epoch from us (clock drift).
+  // We must reply on the proposer's session so it receives our ACK/NACK.
+  const proposerSessionId = proposalMsg.sessionId || sessionId;
+  if (proposerSessionId !== sessionId) {
+    console.log(`[Consensus] Accepted proposal from adjacent epoch: ${proposerSessionId} (ours: ${sessionId})`);
+  }
   console.log(`[Consensus] Received proposal from party ${proposalMsg.sender}`);
 
   const { sourceChain, txHash, txNonce, depositId } = proposalMsg.data;
@@ -326,7 +368,7 @@ export async function runAsAcceptor(sessionId) {
   if (!chainDepositData) {
     console.log('[Consensus] NACK: could not independently verify deposit on-chain');
     await sendToParty(proposalMsg.sender, {
-      sessionId,
+      sessionId: proposerSessionId,
       type: 'proposal_response',
       data: { accepted: false, reason: 'chain verification failed' },
     });
@@ -345,7 +387,7 @@ export async function runAsAcceptor(sessionId) {
     console.error(`  On-chain amount: ${chainDepositData.amount}, proposer claimed: ${proposerData.amount}`);
     console.error(`  On-chain receiver: ${chainDepositData.receiver}, proposer claimed: ${proposerData.receiver}`);
     await sendToParty(proposalMsg.sender, {
-      sessionId,
+      sessionId: proposerSessionId,
       type: 'proposal_response',
       data: { accepted: false, reason: 'data mismatch' },
     });
@@ -369,7 +411,7 @@ export async function runAsAcceptor(sessionId) {
       console.error(`  Acceptor computed: ${acceptorSignHash}`);
       console.error(`  Proposer claimed:  ${proposerData.signHash}`);
       await sendToParty(proposalMsg.sender, {
-        sessionId,
+        sessionId: proposerSessionId,
         type: 'proposal_response',
         data: { accepted: false, reason: 'signHash mismatch' },
       });
@@ -387,7 +429,7 @@ export async function runAsAcceptor(sessionId) {
   if (existingDeposit && existingDeposit.status !== 'pending') {
     console.log(`[Consensus] NACK: deposit already ${existingDeposit.status} (${chainDepositData.txHash})`);
     await sendToParty(proposalMsg.sender, {
-      sessionId,
+      sessionId: proposerSessionId,
       type: 'proposal_response',
       data: { accepted: false, reason: `already ${existingDeposit.status}` },
     });
@@ -400,17 +442,17 @@ export async function runAsAcceptor(sessionId) {
 
   console.log(`[Consensus] ACK: independently verified deposit on-chain`);
 
-  // Send ACK to proposer
+  // Send ACK to proposer (using proposer's session ID)
   await sendToParty(proposalMsg.sender, {
-    sessionId,
+    sessionId: proposerSessionId,
     type: 'proposal_response',
     data: { accepted: true },
   });
 
-  // 2. Wait for signer set
+  // 2. Wait for signer set (using proposer's session ID)
   let signerSetMsg;
   try {
-    signerSetMsg = await waitForSignerSet(sessionId, config.session.consensusTimeoutMs * 2);
+    signerSetMsg = await waitForSignerSet(proposerSessionId, config.session.consensusTimeoutMs * 2);
   } catch {
     throw new Error('Consensus timeout waiting for signer set');
   }
@@ -441,6 +483,7 @@ export async function runAsAcceptor(sessionId) {
   return {
     deposit,
     signers: signerSetMsg.data.signers,
+    sessionId: proposerSessionId, // Actual session ID (may differ from ours by ±1 epoch)
   };
 }
 

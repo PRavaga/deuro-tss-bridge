@@ -63,7 +63,7 @@ export const config = {
   // Session timing
   session: {
     intervalMs: parseInt(process.env.SESSION_INTERVAL_MS ?? '60000'),
-    consensusTimeoutMs: parseInt(process.env.CONSENSUS_TIMEOUT_MS ?? '10000'),
+    consensusTimeoutMs: parseInt(process.env.CONSENSUS_TIMEOUT_MS ?? '30000'),
     signingTimeoutMs: parseInt(process.env.SIGNING_TIMEOUT_MS ?? '30000'),
   },
 

@@ -70,10 +70,12 @@ export function getPendingDeposits(destChain) {
 
 export function updateDepositStatus(id, status, signatures = null) {
   const db = getDb();
+  // Never downgrade from 'finalized' — prevents race where a concurrent
+  // finalization notification gets overwritten by a proposer timeout reset.
   const stmt = db.prepare(`
     UPDATE deposits
     SET status = ?, signatures = ?, updated_at = unixepoch()
-    WHERE id = ?
+    WHERE id = ? AND status != 'finalized'
   `);
   return stmt.run(status, signatures ? JSON.stringify(signatures) : null, id);
 }
